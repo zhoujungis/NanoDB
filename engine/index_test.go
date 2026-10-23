@@ -43,6 +43,94 @@ func TestIndexNegativeZeroEquality(t *testing.T) {
 	}
 }
 
+func TestCompoundIndexQueryAndUnique(t *testing.T) {
+	dir := t.TempDir()
+	db := openTestDB(t, dir)
+
+	docs := []map[string]any{
+		{"_id": "a", "age": 20, "name": "Alice"},
+		{"_id": "b", "age": 20, "name": "Bob"},
+		{"_id": "c", "age": 30, "name": "Alice"},
+		{"_id": "d", "age": 40, "name": "Dan"},
+	}
+	for _, doc := range docs {
+		if _, err := db.Insert("users", doc); err != nil {
+			t.Fatalf("Insert: %v", err)
+		}
+	}
+	if err := db.CreateIndex("users", "age,name", false); err != nil {
+		t.Fatalf("CreateIndex 复合: %v", err)
+	}
+
+	specs := db.ListIndexes("users")
+	if len(specs) != 1 || specs[0].Field != "age,name" || len(specs[0].Fields) != 2 {
+		t.Fatalf("复合索引定义 = %+v", specs)
+	}
+
+	filter := map[string]any{"age": 20, "name": "Alice"}
+	got, err := db.Find("users", Query{Filter: filter})
+	if err != nil || len(got) != 1 || got[0]["_id"] != "a" {
+		t.Fatalf("复合等值查询 = %v, %v", got, err)
+	}
+	if c := db.colls["users"]; c == nil || c.planCandidates(filter) == nil {
+		t.Fatal("两个字段都有条件时应使用复合索引")
+	}
+	if c := db.colls["users"]; c.planCandidates(map[string]any{"age": 20}) != nil {
+		t.Fatal("只给首字段条件时不应使用复合索引")
+	}
+
+	rangeFilter := map[string]any{"age": map[string]any{"$gte": 20}, "name": "Alice"}
+	got, err = db.Find("users", Query{Filter: rangeFilter})
+	if err != nil || len(got) != 2 {
+		t.Fatalf("复合范围查询 = %v, %v, want 2", got, err)
+	}
+
+	// 数组字段无法进入复合索引，索引被标记为不完整后必须回退全表扫描且结果正确。
+	if _, err := db.Insert("users", map[string]any{"_id": "e", "age": []any{30}, "name": "Alice"}); err != nil {
+		t.Fatalf("Insert array doc: %v", err)
+	}
+	got, err = db.Find("users", Query{Filter: map[string]any{"age": 30, "name": "Alice"}})
+	if err != nil || len(got) != 2 {
+		t.Fatalf("含数组文档后查询 = %v, %v, want 2", got, err)
+	}
+	if c := db.colls["users"]; c.planCandidates(filter) != nil {
+		t.Fatal("索引不完整时应回退全表扫描")
+	}
+
+	// 唯一复合索引：同一 (age,name) 组合不允许重复。
+	if err := db.CreateIndex("uniq", "age,name", true); err != nil {
+		t.Fatalf("CreateIndex unique: %v", err)
+	}
+	if _, err := db.Insert("uniq", map[string]any{"_id": "u1", "age": 1, "name": "x"}); err != nil {
+		t.Fatalf("Insert u1: %v", err)
+	}
+	if _, err := db.Insert("uniq", map[string]any{"_id": "u2", "age": 1, "name": "y"}); err != nil {
+		t.Fatalf("不同 name 应允许: %v", err)
+	}
+	if _, err := db.Insert("uniq", map[string]any{"_id": "u3", "age": 1, "name": "x"}); !errors.Is(err, ErrDuplicateKey) {
+		t.Fatalf("重复组合期望 ErrDuplicateKey，得到 %v", err)
+	}
+	if _, err := db.Insert("uniq", map[string]any{"_id": "u4", "age": []any{2}, "name": "x"}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("唯一复合索引不接受数组字段，得到 %v", err)
+	}
+
+	// 关闭后重开，索引定义与唯一约束都应从 WAL 恢复。
+	if err := db.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	db2, err := Open(dir, &Options{Sync: false})
+	if err != nil {
+		t.Fatalf("重新 Open: %v", err)
+	}
+	defer db2.Close()
+	if specs := db2.ListIndexes("uniq"); len(specs) != 1 || len(specs[0].Fields) != 2 {
+		t.Fatalf("重开后复合索引 = %+v", specs)
+	}
+	if _, err := db2.Insert("uniq", map[string]any{"_id": "u5", "age": 1, "name": "x"}); !errors.Is(err, ErrDuplicateKey) {
+		t.Fatalf("重开后唯一约束失效: %v", err)
+	}
+}
+
 func TestSecondaryIndexQueryAndPersistence(t *testing.T) {
 	dir := t.TempDir()
 	db := openTestDB(t, dir)

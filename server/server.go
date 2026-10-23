@@ -2,7 +2,6 @@ package server
 
 import (
 	"crypto/rand"
-	"crypto/subtle"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -38,16 +37,32 @@ type dataStore interface {
 type Server struct {
 	db    *engine.DB
 	token string
+	users *UserStore
 
 	mu  sync.Mutex
 	txs map[string]*txSession // 显式事务会话
 }
 
+// Options 配置 HTTP 服务的鉴权方式。
+type Options struct {
+	// Token 是共享管理 token，保留为 admin 兼容入口；为空表示不启用该入口。
+	Token string
+	// Users 是用户账号存储；nil 表示只使用共享 token（或完全不鉴权）。
+	Users *UserStore
+}
+
 // New 创建 HTTP 服务，token 为空表示不开启鉴权。
 func New(db *engine.DB, token string) *Server {
+	return NewWithOptions(db, Options{Token: token})
+}
+
+// NewWithOptions 创建带用户体系的 HTTP 服务。
+// token 与 users 都为空时不启用鉴权（全部请求视为 admin）。
+func NewWithOptions(db *engine.DB, o Options) *Server {
 	return &Server{
 		db:    db,
-		token: token,
+		token: o.Token,
+		users: o.Users,
 		txs:   make(map[string]*txSession),
 	}
 }
@@ -83,10 +98,16 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 		return
 	}
-	if !s.authorized(r) {
+	p, ok := s.authenticate(r)
+	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	if !allowRequest(p, r.Method, path) {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	r = withPrincipal(r, p)
 	if path == "" {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"name":    "NanoDB",
@@ -101,17 +122,6 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.serveV1(w, r, parts[1:])
-}
-
-func (s *Server) authorized(r *http.Request) bool {
-	if s.token == "" {
-		return true
-	}
-	got := r.Header.Get("X-NanoDB-Token")
-	if h := r.Header.Get("Authorization"); strings.HasPrefix(h, "Bearer ") {
-		got = strings.TrimSpace(strings.TrimPrefix(h, "Bearer "))
-	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(s.token)) == 1
 }
 
 func (s *Server) serveV1(w http.ResponseWriter, r *http.Request, parts []string) {
@@ -130,6 +140,8 @@ func (s *Server) serveV1(w http.ResponseWriter, r *http.Request, parts []string)
 		s.serveIndexes(w, r, parts[1:])
 	case "transactions":
 		s.serveTransactions(w, r, parts[1:])
+	case "aggregate":
+		s.serveAggregate(w, r, parts[1:])
 	default:
 		coll := parts[0]
 		switch len(parts) {
@@ -159,6 +171,14 @@ func (s *Server) serveCollections(w http.ResponseWriter, r *http.Request, rest [
 }
 
 func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request, rest []string) {
+	if len(rest) == 0 {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if rest[0] == "users" {
+		s.serveUsers(w, r, rest[1:])
+		return
+	}
 	if len(rest) != 1 {
 		writeError(w, http.StatusNotFound, "not found")
 		return
@@ -185,6 +205,49 @@ func (s *Server) serveAdmin(w http.ResponseWriter, r *http.Request, rest []strin
 	}
 }
 
+// serveUsers 管理用户账号：
+//
+//	GET    /v1/admin/users         列出用户（含 token）
+//	POST   /v1/admin/users         新建用户 {"name","role","collections"}
+//	DELETE /v1/admin/users/{name}  删除用户
+func (s *Server) serveUsers(w http.ResponseWriter, r *http.Request, rest []string) {
+	if s.users == nil {
+		writeError(w, http.StatusBadRequest, "user store is not configured")
+		return
+	}
+	switch {
+	case len(rest) == 0 && r.Method == http.MethodGet:
+		writeJSON(w, http.StatusOK, s.users.List())
+	case len(rest) == 0 && r.Method == http.MethodPost:
+		var body struct {
+			Name        string   `json:"name"`
+			Role        string   `json:"role"`
+			Collections []string `json:"collections"`
+		}
+		if err := decodeBody(w, r, &body); err != nil {
+			writeDecodeError(w, err)
+			return
+		}
+		if body.Role == "" {
+			body.Role = RoleWrite
+		}
+		u, err := s.users.Add(body.Name, body.Role, body.Collections)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusCreated, u)
+	case len(rest) == 1 && r.Method == http.MethodDelete:
+		if err := s.users.Remove(rest[0]); err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"deleted": rest[0]})
+	default:
+		methodNotAllowed(w, "GET, POST, DELETE")
+	}
+}
+
 func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, rest []string) {
 	if len(rest) != 0 {
 		writeError(w, http.StatusNotFound, "not found")
@@ -202,6 +265,15 @@ func (s *Server) serveBatch(w http.ResponseWriter, r *http.Request, rest []strin
 	if len(ops) == 0 {
 		writeError(w, http.StatusBadRequest, "empty batch")
 		return
+	}
+	// 批量操作跨多个集合，集合白名单只能逐条校验。
+	if p, ok := principalFrom(r); ok && len(p.collections) > 0 {
+		for _, op := range ops {
+			if !p.canCollection(op.Coll) {
+				writeError(w, http.StatusForbidden, "forbidden collection: "+op.Coll)
+				return
+			}
+		}
 	}
 	results, err := s.db.Batch(ops)
 	if err != nil {
@@ -392,14 +464,19 @@ func (s *Server) serveIndexes(w http.ResponseWriter, r *http.Request, rest []str
 				writeDecodeError(w, err)
 				return
 			}
-			if spec.Field == "" {
+			field := spec.Field
+			if len(spec.Fields) > 0 {
+				field = strings.Join(spec.Fields, ",")
+			}
+			if field == "" {
 				writeError(w, http.StatusBadRequest, "field is required")
 				return
 			}
-			if err := s.db.CreateIndex(coll, spec.Field, spec.Unique); err != nil {
+			if err := s.db.CreateIndex(coll, field, spec.Unique); err != nil {
 				writeDBError(w, err)
 				return
 			}
+			spec.Field = field
 			writeJSON(w, http.StatusCreated, spec)
 		default:
 			methodNotAllowed(w, "GET, POST")
@@ -418,6 +495,31 @@ func (s *Server) serveIndexes(w http.ResponseWriter, r *http.Request, rest []str
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
+}
+
+// serveAggregate 处理 POST /v1/aggregate/{集合}，请求体为 {"pipeline":[...]}。
+func (s *Server) serveAggregate(w http.ResponseWriter, r *http.Request, rest []string) {
+	if len(rest) != 1 {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	var body struct {
+		Pipeline []map[string]any `json:"pipeline"`
+	}
+	if err := decodeBody(w, r, &body); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	docs, err := s.db.Aggregate(rest[0], body.Pipeline)
+	if err != nil {
+		writeDBError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, docs)
 }
 
 func serveCollection(w http.ResponseWriter, r *http.Request, st dataStore, coll string) {

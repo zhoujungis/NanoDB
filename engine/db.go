@@ -33,6 +33,8 @@ var (
 	ErrDuplicateKey = errors.New("nanodb: duplicate unique index key")
 	// ErrClosed 表示数据库已关闭。
 	ErrClosed = errors.New("nanodb: database closed")
+	// ErrLocked 表示数据目录已被其他进程打开。
+	ErrLocked = errors.New("nanodb: database directory is locked by another process")
 	// ErrInvalid 表示调用方传入的参数不合法。
 	ErrInvalid = errors.New("nanodb: invalid argument")
 	// ErrInvalidUpdate 表示更新表达式不合法。
@@ -56,6 +58,7 @@ type DB struct {
 	mu       sync.RWMutex
 	colls    map[string]*collection
 	versions map[string]uint64 // 每个集合的写入版本，用于事务提交时的冲突检测
+	lock     *os.File
 	wal      *os.File
 	walBytes int64
 	walGen   uint64 // 当前 WAL 代数，启动时取自快照
@@ -154,6 +157,7 @@ type walRecord struct {
 	Doc    map[string]any `json:"doc,omitempty"`
 	Ops    []walRecord    `json:"ops,omitempty"`
 	Field  string         `json:"field,omitempty"`
+	Fields []string       `json:"fields,omitempty"`
 	Unique bool           `json:"unique,omitempty"`
 }
 
@@ -183,22 +187,31 @@ func Open(dir string, opts *Options) (*DB, error) {
 		return nil, fmt.Errorf("nanodb: create %s: %w", dir, err)
 	}
 
+	lockFile, err := acquireDirLock(dir)
+	if err != nil {
+		return nil, err
+	}
+
 	db := &DB{
 		dir:              dir,
 		sync:             o.Sync,
 		compactThreshold: o.CompactThreshold,
 		colls:            make(map[string]*collection),
 		versions:         make(map[string]uint64),
+		lock:             lockFile,
 	}
 	if err := db.loadSnapshot(); err != nil {
+		releaseDirLock(lockFile)
 		return nil, err
 	}
 	if err := db.openWAL(); err != nil {
+		releaseDirLock(lockFile)
 		return nil, err
 	}
 	if db.walBytes > db.compactThreshold {
 		if err := db.compactLocked(); err != nil {
 			_ = db.wal.Close()
+			releaseDirLock(lockFile)
 			return nil, err
 		}
 	}
@@ -236,8 +249,9 @@ func (db *DB) loadSnapshot() error {
 			db.colls[name] = c
 		}
 		for _, spec := range specs {
-			if spec.Field == "" {
-				return fmt.Errorf("nanodb: snapshot index in %q has empty field", name)
+			spec, err := normalizeIndexSpec(spec)
+			if err != nil {
+				return fmt.Errorf("nanodb: snapshot index in %q: %w", name, err)
 			}
 			ix, err := buildIndex(c, spec)
 			if err != nil {
@@ -334,18 +348,19 @@ func (db *DB) applyRecord(rec walRecord) error {
 			}
 		}
 	case "index.create":
-		if rec.Field == "" {
-			return fmt.Errorf("nanodb: wal index record without field")
+		spec, err := normalizeIndexSpec(IndexSpec{Field: rec.Field, Fields: rec.Fields, Unique: rec.Unique})
+		if err != nil {
+			return fmt.Errorf("nanodb: wal index record: %w", err)
 		}
 		c := db.getCollection(rec.Coll)
-		if _, exists := c.indexes[rec.Field]; exists {
+		if _, exists := c.indexes[spec.Field]; exists {
 			return nil
 		}
-		ix, err := buildIndex(c, IndexSpec{Field: rec.Field, Unique: rec.Unique})
+		ix, err := buildIndex(c, spec)
 		if err != nil {
-			return fmt.Errorf("nanodb: replay index %q on %q: %w", rec.Field, rec.Coll, err)
+			return fmt.Errorf("nanodb: replay index %q on %q: %w", spec.Field, rec.Coll, err)
 		}
-		c.indexes[rec.Field] = ix
+		c.indexes[spec.Field] = ix
 	case "index.drop":
 		if c := db.colls[rec.Coll]; c != nil {
 			delete(c.indexes, rec.Field)
@@ -927,7 +942,10 @@ func (db *DB) compactLocked() error {
 	return nil
 }
 
-// Close 关闭数据库，释放 WAL 文件句柄。
+// Dir 返回数据目录路径。
+func (db *DB) Dir() string { return db.dir }
+
+// Close 关闭数据库，释放 WAL 文件句柄与目录锁。
 func (db *DB) Close() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -935,8 +953,12 @@ func (db *DB) Close() error {
 		return nil
 	}
 	db.closed = true
-	if db.wal == nil {
-		return nil
+	var err error
+	if db.wal != nil {
+		err = db.wal.Close()
+		db.wal = nil
 	}
-	return db.wal.Close()
+	releaseDirLock(db.lock)
+	db.lock = nil
+	return err
 }

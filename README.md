@@ -18,6 +18,7 @@ NanoDB 是一个用 Go 编写的轻量级嵌入式文档数据库（NoSQL），�
 - [查询](#查询)
 - [更新](#更新)
 - [二级索引](#二级索引)
+- [聚合管道](#聚合管道)
 - [原子批量写入](#原子批量写入)
 - [显式事务](#显式事务)
 - [命令行](#命令行)
@@ -35,11 +36,13 @@ NanoDB 是一个用 Go 编写的轻量级嵌入式文档数据库（NoSQL），�
 - **文档模型**：集合内直接存 JSON 对象，无固定表结构；`_id` 必须是字符串，未提供时自动生成带时间前缀的 ID。
 - **持久化**：快照 + 预写日志（WAL）；默认每次写入 `fsync`；WAL 超过阈值自动压缩；崩溃后自动重放，尾部撕裂记录会被安全截断。
 - **查询**：字段等值、比较、集合、存在性、正则、逻辑组合；支持多字段排序、分页和字段投影；排序键预抽取，带 `limit` 的排序自动走 Top-N，避免全量排序。
-- **二级索引**：单字段有序索引，支持等值、`$in`、范围查询和数组 multikey；可为索引添加唯一约束；查询计划自动选择候选集最小的索引。
+- **二级索引**：单字段或复合索引（`a,b`），支持等值、`$in`、范围查询和数组 multikey；可为索引添加唯一约束；查询计划自动选择候选集最小的索引。
+- **聚合管道**：`$match`、`$group`、`$sort`、`$skip`、`$limit`、`$project`、`$unwind`、`$count`，支持 `$sum/$avg/$min/$max/$first/$last/$push` 累加器。
 - **原子批量写入**：一组写操作要么全部生效，要么全部不生效，成功时只落一条 WAL 记录。
 - **显式事务**：`Begin` / `Commit` / `Rollback`，集合快照读 + 提交时冲突检测，详见 [事务隔离级别说明](docs/transaction-isolation.md)。
-- **并发安全**：同一个 `*DB` 实例可被多个 goroutine 并发使用。
+- **并发安全**：同一个 `*DB` 实例可被多个 goroutine 并发使用；数据目录带操作系统级独占锁，进程异常退出会自动释放。
 - **多入口**：交互式 shell、一次性 CLI 命令、REST 服务，覆盖全部核心能力。
+- **HTTP 权限**：共享 token 作为 admin 入口；可按用户发放 token，限制 `admin/write/read` 角色与集合白名单。
 
 ## 环境与构建
 
@@ -160,7 +163,9 @@ curl -H 'X-NanoDB-Token: secret' localhost:8080/v1/users
 ```text
 数据库目录
 ├── snapshot.json   # 某一时刻的全量数据与索引定义
-└── wal.log         # 快照之后的增量操作日志（JSON Lines）
+├── wal.log         # 快照之后的增量操作日志（JSON Lines）
+├── LOCK            # 进程独占锁（空文件，由操作系统加锁）
+└── users.json      # 可选：HTTP 账号，存在时启用用户体系
 ```
 
 ```text
@@ -344,16 +349,20 @@ docs, err := db.Find("users", engine.Query{
 ```bash
 ./bin/nanodb -db ./data index create users age          # 普通索引
 ./bin/nanodb -db ./data index create users email unique # 唯一索引
+./bin/nanodb -db ./data index create users age,name     # 复合索引
 ./bin/nanodb -db ./data index list users
 ./bin/nanodb -db ./data index drop users age
+./bin/nanodb -db ./data index drop users age,name
 ```
 
 索引规则：
 
-- 单字段有序索引；字段支持点号路径（如 `profile.city`）。
+- 单字段或复合索引（字段用逗号分隔，顺序有意义）；字段支持点号路径（如 `profile.city`）。
 - 支持可索引的标量：字符串、布尔、数字。`null`、缺失字段、对象等不会被写入索引。
-- 数组字段按 multikey 处理：每个非空元素建一条索引项，同一文档内重复元素只保留一次。
+- 单字段数组按 multikey 处理：每个非空元素建一条索引项，同一文档内重复元素只保留一次。
+- 复合索引要求所有字段都是标量；含数组字段的文档不会进入索引，该索引随后只用于唯一性/维护，查询规划整体回退全表扫描以保证不漏查。
 - 唯一索引按“每个元素”校验：两个文档的数组若含有相同元素，同样会冲突。
+- 唯一复合索引按整个字段组合判重，并要求字段为标量；任意字段是数组时写入返回 `ErrInvalid`。
 - 创建唯一索引会校验存量数据，冲突返回 `ErrDuplicateKey`，索引不会创建。
 - 以相同参数重复创建同一索引是幂等的（返回成功）；同字段但 `unique` 不同返回 `ErrInvalid`。
 - 删除不存在的索引视为成功。
@@ -364,6 +373,7 @@ docs, err := db.Find("users", engine.Query{
 - 从过滤条件中选择候选集最小的索引，只扫描候选文档；没有可用索引时回退全表扫描。
 - 可用的索引条件：等值（含 `$eq`）、`$in`、`$gt` / `$gte` / `$lt` / `$lte`。
 - 会检查顶层字段以及 `$and` 的子条件；`$or` / `$not` 下不会使用索引候选集（直接全表扫描），以保证结果正确。
+- 复合索引只有在每个字段都有条件时才会被使用：先用首字段条件二分定位条目区间，再逐条校验其余字段。
 - 范围查询在有序索引项上二分定位边界，复杂度为 `O(log n + 命中数)`。
 - 等值 / `$in` 查询使用索引键到文档 ID 的映射。
 - 索引本身不存储文档副本，最终结果仍会回表并按查询语义重新过滤。
@@ -376,6 +386,11 @@ $ ./bin/nanodb -db ./data index list users
   {
     "field": "age",
     "unique": false
+  },
+  {
+    "field": "age,name",
+    "fields": ["age", "name"],
+    "unique": true
   },
   {
     "field": "email",
@@ -400,7 +415,78 @@ $ ./bin/nanodb -db ./data index list users
 - 索引条目常驻内存，内存占用约为“文档数 × 索引数 × 单条索引项”。
 - 低选择性字段（例如只有 `true/false` 的布尔字段）建索引收益有限，通常不如全表扫描。
 
-限制：暂不支持复合索引、文本索引、地理索引、聚合管道、索引覆盖查询和 `$not` 索引优化。
+限制：暂不支持文本索引、地理索引、索引覆盖查询和 `$not` 索引优化；聚合管道不参与索引规划，始终从集合全部文档开始。
+
+## 聚合管道
+
+CLI：
+
+```bash
+./bin/nanodb -db ./data aggregate users '[
+  {"$match":{"age":{"$gte":18}}},
+  {"$group":{"_id":"$profile.city","count":{"$sum":1},"avgAge":{"$avg":"$age"}}},
+  {"$sort":{"count":-1}},
+  {"$limit":5}
+]'
+```
+
+- CLI：`aggregate <集合> <管道JSON|->`；管道可写成数组（多个阶段）或单个对象（一个阶段），`-` 表示从标准输入读取。
+- HTTP：`POST /v1/aggregate/{coll}`，body 为 `{"pipeline":[...]}`，响应是结果数组。
+- Go：`db.Aggregate(coll, pipeline)`，参数类型为 `[]map[string]any`。
+
+### 阶段
+
+| 阶段 | 语法 | 说明 |
+|---|---|---|
+| `$match` | `{"$match":{"age":{"$gte":18}}}` | 过滤条件与 `find` 完全相同，只编译一次 |
+| `$group` | `{"$group":{"_id":"$city","n":{"$sum":1}}}` | 按 `_id` 表达式分组；省略 `_id` 视为 `null`（整个集合一组） |
+| `$sort` | `{"$sort":{"age":-1}}`、`{"$sort":"age:-1"}`、`{"$sort":[{"age":-1},{"name":1}]}` | 对象形式没有顺序，按字段名排序以保证确定性；数组形式可表达优先级 |
+| `$skip` | `{"$skip":10}` | 跳过当前结果的前 N 条，N 必须是非负整数 |
+| `$limit` | `{"$limit":10}` | 只保留当前结果的前 N 条 |
+| `$project` | `{"$project":{"name":1,"age":1}}` 或 `{"$project":{"password":0}}` | 包含式只保留 truthy 字段（`_id` 也需显式写 `1`）；排除式删除指定字段；不支持两种混用 |
+| `$unwind` | `{"$unwind":"tags"}` 或 `{"$unwind":{"path":"tags","preserveNullAndEmptyArrays":true}}` | 把数组字段拆成多条文档；非数组、缺失或空数组默认丢弃，`preserve...` 为 `true` 时原样保留 |
+| `$count` | `{"$count":"total"}` | 输出单条 `{"total":n}`；输入为空时输出 `[]` |
+
+每个阶段必须恰好包含一个操作符；未知阶段或非法参数返回 `ErrInvalid`（HTTP `400`）。管道按数组顺序执行。
+
+### 累加器
+
+`$group` 的输出字段值必须是单个累加器对象，例如 `{"n":{"$sum":1}}`：
+
+| 累加器 | 说明 |
+|---|---|
+| `$sum` | 数值求和；非数字值被忽略 |
+| `$avg` | 数值平均；非数字值被忽略，全部非数字时为 `0` |
+| `$min` / `$max` | 可比较时取极值，不可比较时保留首个值 |
+| `$first` / `$last` | 按管道顺序取首个 / 最后一个值 |
+| `$push` | 收集所有值到数组 |
+| `$count` | 统计条数，参数被忽略（写 `{"$count":1}`） |
+
+### 表达式
+
+- 字符串以 `$` 开头表示字段引用，支持点号路径（`"$profile.city"`）；字段缺失时求值为 `nil`。
+- 其他字符串、数字、布尔、`null` 都是字面量（以非 `$` 开头）。
+- 对象与数组会递归求值，因此 `_id` 可以用 `{"city":"$profile.city","year":"$year"}` 这类组合键。
+- 分组键按规范化后的 JSON 编码判等：`1` 与 `1.0` 属于同一组，对象键顺序不影响分组。
+
+### 语义与限制
+
+- 聚合不参与索引规划：每个管道都从集合全部文档开始，`$match` 也走逐文档匹配，适合中小数据量。
+- 管道内部的文档以引用传递，只有 `$unwind` 和排除式 `$project` 按需复制；最终输出统一深拷贝。
+- 不支持 `$lookup`、`$facet`、窗口函数以及 `$out` / `$merge`。
+- 聚合是只读操作，不会写入 WAL。
+
+示例输出（`./bin/nanodb -db ./data aggregate users '[...]'`）：
+
+```json
+[
+  {
+    "_id": "Shanghai",
+    "avgAge": 32.5,
+    "count": 2
+  }
+]
+```
 
 ## 原子批量写入
 
@@ -519,19 +605,25 @@ put <集合> <JSON文档>           插入文档，未提供 _id 时自动生成
 get <集合> <id>                 读取单个文档
 find <集合> [过滤JSON]          查询文档（-sort/-limit/-skip/-fields）
 count <集合> [过滤JSON]         统计文档数量
+aggregate <集合> <管道JSON|->   执行聚合管道；- 表示从标准输入读取
 update <集合> <id> <更新JSON>   更新文档
 delete <集合> <id>              删除单个文档
 drop <集合>                     删除整个集合
-index create <集合> <字段> [unique]  创建二级索引；unique 表示唯一索引
-index drop <集合> <字段>        删除索引
+index create <集合> <字段[,字段2...]> [unique]  创建单字段或复合索引；unique 表示唯一索引
+index drop <集合> <字段[,字段2...]>  删除索引
 index list <集合>               查看索引
 batch <操作JSON数组|->          原子批量写入；- 表示从标准输入读取
 collections                     列出所有集合
 stats                           查看数据库统计
 compact                         生成快照并清空 WAL
-serve [-addr :8080] [-token X]  启动 HTTP 服务
+serve [-addr :8080] [-token X]  启动 HTTP 服务；token 是共享 admin 凭据
+user add <名字> [角色] [集合,...] 新建 HTTP 账号（角色 admin/write/read，默认 write）
+user list                       列出 HTTP 账号及其 token
+user remove <名字>              删除 HTTP 账号
 help                            显示帮助
 ```
+
+`user` 命令直接读写数据目录下的 `users.json`，不会打开数据库，因此可以在 `serve` 运行期间执行（不受目录独占锁影响）。
 
 `find` 的选项：
 
@@ -560,12 +652,16 @@ help                            显示帮助
 | `get` | 文档对象；不存在时报错 |
 | `find` | 文档数组；无命中时为 `[]` |
 | `count` | `{"count":n}` |
+| `aggregate` | 管道结果数组；无命中时为 `[]` |
 | `update` | 更新后的完整文档 |
 | `delete` / `drop` | `{"deleted":true}` / `{"dropped":"集合名"}` |
-| `index create` | `{"created":true,"field":"...","unique":false}` |
+| `index create` | `{"created":true,"field":"age,name","unique":false}` |
 | `index drop` | `{"dropped":"字段名"}` |
 | `index list` | 索引定义数组 |
 | `batch` | 每步结果的数组 |
+| `user add` | 新账号对象（含生成的 `token`） |
+| `user list` | 账号数组 |
+| `user remove` | `{"deleted":"名字"}` |
 | `collections` | `[{"name":"...","count":n}]` |
 | `stats` | 统计对象（见上） |
 | `compact` | `{"compacted":true}` |
@@ -614,7 +710,7 @@ nano> exit
 
 通用约定：
 
-- 除 `/healthz` 外，设置 token 后所有请求都需要鉴权；支持 `X-NanoDB-Token: <token>` 或 `Authorization: Bearer <token>`，使用常量时间比较。
+- 除 `/healthz` 外，所有请求默认需要鉴权；支持 `X-NanoDB-Token: <token>` 或 `Authorization: Bearer <token>`，使用常量时间比较。既没有配置 `-token` 也没有 `users.json` 时保持免鉴权。
 - 写入接口的 `Content-Type` 应为 `application/json`。
 - 请求体上限 8 MiB，超限返回 `413`；JSON 后出现多余内容会返回 `400`。
 - 错误响应体统一为 `{"error":"..."}`。
@@ -637,13 +733,68 @@ nano> exit
 | PATCH | `/v1/{coll}/{id}` | 按更新操作符修改文档 |
 | DELETE | `/v1/{coll}/{id}` | 删除文档，返回 `{"deleted":true}` |
 | GET | `/v1/indexes/{coll}` | 列出索引 |
-| POST | `/v1/indexes/{coll}` | 创建索引，body：`{"field":"age","unique":false}` |
-| DELETE | `/v1/indexes/{coll}/{field}` | 删除索引，返回 `{"dropped":field}` |
+| POST | `/v1/indexes/{coll}` | 创建索引，body：`{"field":"age","unique":false}`；复合索引写 `{"fields":["age","name"],"unique":true}` |
+| DELETE | `/v1/indexes/{coll}/{field}` | 删除索引，返回 `{"dropped":field}`；复合索引用逗号写字段名，如 `age,name` |
+| POST | `/v1/aggregate/{coll}` | 执行聚合管道，body：`{"pipeline":[...]}` |
 | POST | `/v1/batch` | 原子批量写入 |
 | GET | `/v1/admin/stats` | 统计信息 |
 | POST | `/v1/admin/compact` | 压缩存储，返回 `{"compacted":true}` |
+| GET | `/v1/admin/users` | 列出 HTTP 账号（含 token），需要 admin |
+| POST | `/v1/admin/users` | 新建账号，body：`{"name","role","collections"}`，需要 admin |
+| DELETE | `/v1/admin/users/{name}` | 删除账号，返回 `{"deleted":name}`，需要 admin |
 
 > 注意：`DELETE /v1/{coll}` 不传 `filter`（或 `filter=` 为空）会删除该集合内所有文档。只想删除部分文档时务必带上过滤条件；清空集合更推荐 `DELETE /v1/collections/{coll}`，这样集合本身也会被删除。
+
+### 鉴权与权限
+
+两种凭据可以同时存在：
+
+| 凭据 | 身份 |
+|---|---|
+| `-token` 指定的共享 token | 固定为 `admin`，保留旧的单 token 用法 |
+| `users.json` 中的账号 token | 按账号的 `role` 与 `collections` 授权 |
+
+账号体系只在数据目录下存在 `users.json` 时启用，因此默认的免鉴权 / 单 token 服务行为不变。
+
+角色（由低到高）：
+
+| 角色 | 允许 |
+|---|---|
+| `read` | 所有 GET/HEAD/OPTIONS：查询、读取、集合列表、索引列表 |
+| `write` | `read` 的全部 + 文档写入、按条件删除、批量、事务、聚合 |
+| `admin` | 全部，包括 `/v1/admin/*`（stats、compact、账号管理）、索引创建/删除、删除集合 |
+
+- 集合白名单 `collections` 为空表示可访问全部集合；非空时，CRUD、聚合、索引、事务文档路径都只能访问列出的集合，`/v1/batch` 会逐条校验每个操作的 `coll`。
+- 未通过鉴权返回 `401`；已鉴权但角色或集合不允许返回 `403`。
+- 账号 token 由服务端生成（32 字节随机数的 64 位十六进制），只在创建时返回，请立即保存。
+- `users.json` 权限为 `0600`，写入采用临时文件 + 原子重命名；服务端按文件修改时间自动重载，手工编辑或 `user` 命令修改都会在下次请求时生效。
+- 删除账号后其 token 立即失效（下一次请求即 401）。
+
+创建账号：
+
+```bash
+./bin/nanodb -db ./data user add alice write users,orders
+```
+
+或通过 HTTP（需要 admin）：
+
+```bash
+curl -X POST localhost:8080/v1/admin/users \
+  -H 'X-NanoDB-Token: secret' -H 'Content-Type: application/json' \
+  -d '{"name":"alice","role":"read","collections":["users"]}'
+```
+
+响应（`201`）：
+
+```json
+{"name":"alice","token":"<64 位十六进制>","role":"read","collections":["users"]}
+```
+
+之后用该 token 访问：
+
+```bash
+curl -H 'X-NanoDB-Token: <64 位十六进制>' localhost:8080/v1/users
+```
 
 ### 查询参数
 
@@ -696,6 +847,14 @@ curl -X POST localhost:8080/v1/indexes/users \
 curl -X POST localhost:8080/v1/batch \
   -H 'Content-Type: application/json' \
   -d '[{"op":"insert","coll":"users","doc":{"name":"A"}},{"op":"insert","coll":"users","doc":{"name":"B"}}]'
+
+# 聚合管道
+curl -X POST localhost:8080/v1/aggregate/users \
+  -H 'Content-Type: application/json' \
+  -d '{"pipeline":[{"$group":{"_id":"$city","n":{"$sum":1}}},{"$sort":{"n":-1}}]}'
+
+# 账号管理（需要 admin 凭据）
+curl -H 'X-NanoDB-Token: secret' localhost:8080/v1/admin/users
 ```
 
 批量插入的原子性：
@@ -765,6 +924,18 @@ DELETE /v1/indexes/users/age
 
 POST /v1/batch
 200 {"count":2,"results":[{"op":"insert","coll":"users","id":"u1","doc":{...}},...]}
+
+POST /v1/aggregate/users
+200 [{"_id":"Shanghai","n":2}]
+
+GET /v1/admin/users
+200 [{"name":"alice","token":"<64 位十六进制>","role":"read","collections":["users"]}]
+
+POST /v1/admin/users
+201 {"name":"alice","token":"<64 位十六进制>","role":"read","collections":["users"]}
+
+DELETE /v1/admin/users/alice
+200 {"deleted":"alice"}
 
 POST /v1/admin/compact
 200 {"compacted":true}
@@ -849,9 +1020,10 @@ curl -X POST -H "$AUTH" $BASE/v1/transactions/$TX/commit
 
 | 状态码 | 场景 |
 |---|---|
-| 400 | 参数或 JSON 不合法、更新表达式非法、空批量、数组元素不是对象 |
-| 401 | 鉴权失败 |
-| 404 | 集合/文档/事务不存在、未知路由 |
+| 400 | 参数或 JSON 不合法、更新表达式非法、空批量、数组元素不是对象、聚合阶段非法 |
+| 401 | 鉴权失败（缺少或无效 token） |
+| 403 | 已鉴权但角色不足或集合不在白名单内 |
+| 404 | 集合/文档/事务/账号不存在、未知路由 |
 | 405 | 方法不支持（带 `Allow` 头） |
 | 409 | `_id` 重复、唯一索引冲突、事务冲突 |
 | 413 | 请求体超过 8 MiB |
@@ -919,7 +1091,8 @@ func main() {
 | `Delete(coll, id)` | `(bool, error)` | 删除并返回是否原本存在 |
 | `DeleteMany(coll, filter)` | `(int, error)` | 按条件删除 |
 | `Batch(ops)` | `([]BatchResult, error)` | 原子批量 |
-| `CreateIndex(coll, field, unique)` | `error` | 创建索引 |
+| `Aggregate(coll, pipeline)` | `([]map[string]any, error)` | 执行聚合管道，返回结果副本 |
+| `CreateIndex(coll, field, unique)` | `error` | 创建索引；`field` 写 `"a,b"` 即为复合索引 |
 | `DropIndex(coll, field)` | `error` | 删除索引；不存在视为成功 |
 | `ListIndexes(coll)` | `[]IndexSpec` | 按字段名排序的索引列表 |
 | `DropCollection(coll)` | `error` | 删除集合；不存在视为成功 |
@@ -993,7 +1166,8 @@ for _, ix := range db.ListIndexes("users") {
 | `ErrDuplicateID` | 插入的 `_id` 已存在 |
 | `ErrDuplicateKey` | 唯一索引冲突 |
 | `ErrClosed` | 数据库已关闭 |
-| `ErrInvalid` | 参数非法（空集合名、空索引字段、空批量等） |
+| `ErrLocked` | 数据目录已被其他进程打开 |
+| `ErrInvalid` | 参数非法（空集合名、空索引字段、空批量、非法聚合阶段等） |
 | `ErrInvalidUpdate` | 更新表达式非法 |
 | `ErrConflict` | 事务提交冲突 |
 | `ErrTxDone` | 事务已结束 |
@@ -1031,7 +1205,7 @@ data/
 
 `gen` 是快照对应的 WAL 代数，每次压缩递增一次：重放 `wal.log` 时只应用 `gen` 不小于快照代数的记录。这样即使压缩过程中“快照已重命名、WAL 尚未清空”时崩溃，旧记录也会被整体跳过，不会重复叠加到快照之上（否则唯一索引可能报冲突）。
 
-WAL 每行一条记录，字段包括 `op`、`gen`、`coll`、`id`、`doc`、`ops`、`field`、`unique`：
+WAL 每行一条记录，字段包括 `op`、`gen`、`coll`、`id`、`doc`、`ops`、`field`、`fields`、`unique`：
 
 | `op` | 含义 |
 |---|---|
@@ -1049,11 +1223,13 @@ WAL 每行一条记录，字段包括 `op`、`gen`、`coll`、`id`、`doc`、`op
 {"op":"put","coll":"users","doc":{"_id":"u1","name":"Alice","age":30}}
 {"op":"delete","coll":"users","id":"u2"}
 {"op":"index.create","coll":"users","field":"age","unique":true}
+{"op":"index.create","coll":"users","fields":["age","name"],"unique":true}
 {"op":"batch","ops":[{"op":"put","coll":"users","doc":{"_id":"u3"}},{"op":"delete","coll":"users","id":"u4"}]}
 {"op":"drop","coll":"users"}
 ```
 
 - `unique: false` 会被省略（`omitempty`），缺省即普通索引。
+- 复合索引在 `index.create` 中额外携带 `fields` 数组；`field` 仍保留逗号拼接的形态便于单条展示。
 - `gen` 为写该记录时的 WAL 代数；`0` 会被省略，因此未经过压缩的库记录中通常看不到该字段。
 - 事务提交写为一条 `{"op":"tx","ops":[...]}` 记录，批量写为 `{"op":"batch","ops":[...]}`。
 - 更新在 WAL 中表现为一条覆盖式的 `put`，记录的是更新后的完整文档。
@@ -1073,14 +1249,14 @@ WAL 每行一条记录，字段包括 `op`、`gen`、`coll`、`id`、`doc`、`op
 - 也可以手动执行 `compact` 或 `POST /v1/admin/compact`。
 - 快照不保存空集合；空集合在压缩后消失。
 - 崩溃导致 WAL 尾部出现不完整记录时，重放会在该记录处停止并截断到最后一个完整记录，之前已提交的数据不受影响。
-- 只支持单进程打开：不要用两个进程同时指向同一目录。
+- 同一目录同一时间只能被一个进程打开：`Open` 对 `LOCK` 文件加操作系统级独占锁，第二个进程返回 `ErrLocked`；进程退出时锁自动释放。
 
 ### 备份与迁移
 
 备份：
 
 1. 停止写入进程（CLI 退出，或向 `serve` 发送 `Ctrl+C` 等待优雅停机）。
-2. 复制整个数据目录（至少包含 `snapshot.json` 与 `wal.log`）。
+2. 复制整个数据目录（包含 `snapshot.json`、`wal.log`，使用账号体系时还有 `users.json`；`LOCK` 无需复制）。
 3. 恢复时把目录放回原位再启动即可。
 
 也可以先执行一次 `compact`，让 `snapshot.json` 包含全量数据、`wal.log` 清空，这样备份只需保证快照文件完整。
@@ -1136,9 +1312,9 @@ go test ./engine -run '^$' -bench Benchmark -benchmem
 
 当前覆盖率约为：engine 80%、server 80%、cmd 75%。测试覆盖：
 
-- 引擎：CRUD、查询操作符、排序/分页/投影、索引与唯一约束、批量原子性、事务隔离与冲突、WAL 重放、压缩、关闭后行为、更新错误路径。
-- server：鉴权、路由、405、参数校验、错误码、事务会话与超时回收、请求体上限。
-- CLI：参数解析、一次性命令全链路、shell 事务与 EOF 回滚、serve 启停。
+- 引擎：CRUD、查询操作符、排序/分页/投影、单字段与复合索引及唯一约束、聚合管道、批量原子性、事务隔离与冲突、WAL 重放、压缩、目录锁、关闭后行为、更新错误路径。
+- server：鉴权、角色与集合白名单、账号存储、路由、405、参数校验、错误码、事务会话与超时回收、请求体上限。
+- CLI：参数解析、一次性命令全链路、shell 事务与 EOF 回滚、serve 启停、user 命令。
 
 基准统一使用 10 万条文档；`BenchmarkFind*` 覆盖等值、范围、投影、分页与排序，`BenchmarkSortRandom*` 是随机序数据上的全量排序与 Top-N A/B。
 
@@ -1151,24 +1327,33 @@ NanoDB/
 ├── docs/
 │   └── transaction-isolation.md   # 事务隔离级别与冲突说明
 ├── cmd/nanodb/
-│   ├── main.go                    # CLI 参数、命令分发、shell、serve
+│   ├── main.go                    # CLI 参数、命令分发、shell、serve、user 管理
 │   └── main_test.go
 ├── server/
-│   ├── server.go                  # REST 路由、鉴权、事务会话
+│   ├── server.go                  # REST 路由、事务会话
+│   ├── auth.go                    # 鉴权、角色与集合白名单
+│   ├── users.go                   # users.json 账号存储
 │   ├── server_test.go
+│   ├── auth_test.go
 │   └── error_test.go
 └── engine/
-    ├── db.go                      # 存储引擎、CRUD、WAL、快照、压缩
+    ├── db.go                      # 存储引擎、CRUD、WAL、快照、压缩、目录锁
+    ├── lock.go                    # 目录独占锁公共逻辑
+    ├── lock_windows.go            # Windows LockFileEx 实现
+    ├── lock_unix.go               # Unix flock 实现
     ├── query.go                   # 过滤匹配、排序、投影
+    ├── aggregate.go               # 聚合管道
     ├── update.go                  # 更新操作符
-    ├── index.go                   # 二级索引与查询计划
+    ├── index.go                   # 单字段与复合索引、查询计划
     ├── batch.go                   # 原子批量写入
     ├── tx.go                      # 显式事务
     ├── id.go                      # _id 生成
     ├── copy.go                    # 文档深拷贝
     ├── db_test.go
     ├── query_test.go
+    ├── aggregate_test.go
     ├── index_test.go
+    ├── lock_test.go
     ├── batch_test.go
     ├── tx_test.go
     └── bench_test.go
@@ -1176,11 +1361,13 @@ NanoDB/
 
 ## 已知限制
 
-- 不支持 SQL、聚合管道、复合索引、文本索引、地理索引。
-- 不支持多进程同时打开同一目录，也不支持副本、分片或集群。
+- 不支持 SQL、文本索引、地理索引。
+- 不支持副本、分片或集群；同一目录同一时间只能被一个进程打开（由 `LOCK` 独占锁强制）。
 - 不支持 Savepoint、事务内 DDL（`drop`、`index create/drop`、`compact`）和跨进程事务。
 - 事务隔离级别固定，不可配置；冲突粒度是集合。
-- HTTP 只有共享 token 鉴权，没有用户体系和细粒度权限。
+- 聚合管道只支持 `$match/$group/$sort/$skip/$limit/$project/$unwind/$count`，不支持 `$lookup`、`$facet`、窗口函数和 `$out`/`$merge`；聚合不使用索引。
+- 复合索引要求字段都是标量，含数组字段的文档不进入索引，此时该索引的查询规划会回退全表扫描。
+- HTTP 账号体系的集合白名单是精确匹配，不支持通配符或按字段/操作的细粒度权限。
 - 文档与索引常驻内存，数据规模受内存限制；WAL 是 JSON Lines，存储开销高于二进制格式。
 - HTTP 单次请求体上限 8 MiB；大导入建议拆分或使用 CLI `batch -`。
 - 数组插入（POST 数组）不是原子的；需要原子性时使用批量接口或事务。
@@ -1213,11 +1400,19 @@ WAL 超过 `CompactThreshold`（默认 4 MiB）会自动压缩。如果没有触
 
 **Q：能从两个进程同时打开同一个数据目录吗？**
 
-不能。NanoDB 没有跨进程锁；请确保同一目录同一时间只被一个进程使用。
+不能。`Open` 会对目录下的 `LOCK` 文件加操作系统级独占锁，第二个进程返回 `ErrLocked`。锁随进程退出自动释放，所以崩溃后残留的 `LOCK` 文件不影响下次打开。
 
 **Q：可以在 HTTP 服务运行时用 CLI 打开同一目录吗？**
 
-不可以，原因同上。CLI 与 serve 应使用不同目录，或先停止服务。
+常规数据命令不行，原因同上（会返回 `ErrLocked`）。但 `user add/list/remove` 只读写 `users.json`、不打开数据库，可以在 `serve` 运行期间执行。
+
+**Q：HTTP 请求返回 403 是什么原因？**
+
+已通过 token 鉴权，但角色或集合不允许：
+
+- `read` 角色发起了写请求。
+- 非 `admin` 调用了 `/v1/admin/*`、创建/删除索引或删除集合。
+- 账号的 `collections` 白名单不包含目标集合（批量接口会逐条校验）。
 
 **Q：查询明明有索引，为什么还是全表扫描？**
 

@@ -277,7 +277,7 @@ func TestServeHTTPStartupAndShutdown(t *testing.T) {
 	ready := make(chan string, 1)
 	done := make(chan error, 1)
 	go func() {
-		done <- serveHTTP(ctx, db, "127.0.0.1:0", "secret", func(string, ...any) {}, func(addr string) {
+		done <- serveHTTP(ctx, db, "127.0.0.1:0", "secret", nil, func(string, ...any) {}, func(addr string) {
 			ready <- addr
 		})
 	}()
@@ -323,7 +323,7 @@ func TestServeHTTPStartupAndShutdown(t *testing.T) {
 
 func TestServeHTTPListenError(t *testing.T) {
 	db := openShellDB(t)
-	if err := serveHTTP(context.Background(), db, "127.0.0.1:-1", "", nil, nil); err == nil {
+	if err := serveHTTP(context.Background(), db, "127.0.0.1:-1", "", nil, nil, nil); err == nil {
 		t.Fatal("非法监听地址应返回错误")
 	}
 }

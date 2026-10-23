@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -53,6 +54,10 @@ func run(args []string) error {
 		usage()
 		return nil
 	}
+	// 用户管理只改 users.json，不打开数据库，避免与运行中的服务争抢目录锁。
+	if cmd == "user" {
+		return runUserCommand(filepath.Join(*dbPath, "users.json"), rest, os.Stdout)
+	}
 
 	db, err := engine.Open(*dbPath, &engine.Options{Sync: !*noSync})
 	if err != nil {
@@ -79,17 +84,21 @@ func usage() {
   find <集合> [过滤JSON]          查询文档
        -sort 字段:-1,...  -limit N  -skip N  -fields 字段1,字段2
   count <集合> [过滤JSON]         统计文档数量
+  aggregate <集合> <管道JSON|->   执行聚合管道，支持 $match/$group/$sort/$skip/$limit/$project/$unwind/$count
   update <集合> <id> <更新JSON>   更新文档，支持 $set/$unset/$inc/$push/$pull/$addToSet
   delete <集合> <id>              删除单个文档
   drop <集合>                     删除整个集合
-  index create <集合> <字段> [unique]  创建二级索引；unique 表示唯一索引
-  index drop <集合> <字段>        删除索引
+  index create <集合> <字段[,字段2...]> [unique]  创建二级索引；逗号分隔为复合索引
+  index drop <集合> <字段[,字段2...]>    删除索引
   index list <集合>               查看索引
   batch <操作JSON数组|->          原子批量写入；- 表示从标准输入读取
   collections                     列出所有集合
   stats                           查看数据库统计
   compact                         生成快照并清空 WAL
-  serve [-addr :8080] [-token X]  启动 HTTP 服务
+  serve [-addr :8080] [-token X]  启动 HTTP 服务；token 为共享 admin 凭据
+  user add <名字> [角色] [集合,...] 新建账号（角色 admin/write/read，默认 write）
+  user list                       列出账号及其 token
+  user remove <名字>              删除账号
 
 示例:
   nanodb -db ./data put users '{"name":"Alice","age":30}'
@@ -235,7 +244,7 @@ func dispatch(s dataStore, db *engine.DB, in io.Reader, out, errOut io.Writer, c
 		switch args[0] {
 		case "create":
 			if len(args) < 3 {
-				return errors.New("用法: index create <集合> <字段> [unique]")
+				return errors.New("用法: index create <集合> <字段[,字段2...]> [unique]")
 			}
 			unique := len(args) > 3 && (args[3] == "unique" || args[3] == "true" || args[3] == "1")
 			if err := db.CreateIndex(args[1], args[2], unique); err != nil {
@@ -282,6 +291,30 @@ func dispatch(s dataStore, db *engine.DB, in io.Reader, out, errOut io.Writer, c
 			return err
 		}
 		return printJSON(out, results)
+
+	case "aggregate":
+		if len(args) < 2 {
+			return errors.New(`用法: aggregate <集合> '[{"$group":{"_id":"$字段"}}]'，用 - 从标准输入读取`)
+		}
+		var data []byte
+		if args[1] == "-" {
+			var err error
+			data, err = io.ReadAll(in)
+			if err != nil {
+				return fmt.Errorf("读取标准输入失败: %w", err)
+			}
+		} else {
+			data = []byte(args[1])
+		}
+		var pipeline []map[string]any
+		if err := json.Unmarshal(data, &pipeline); err != nil {
+			return fmt.Errorf("JSON 解析失败: %w", err)
+		}
+		docs, err := db.Aggregate(args[0], pipeline)
+		if err != nil {
+			return err
+		}
+		return printJSON(out, docs)
 
 	case "collections":
 		return printJSON(out, db.Collections())
@@ -567,11 +600,73 @@ func serve(db *engine.DB, args []string) error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
-	return serveHTTP(ctx, db, *addr, *token, log.Printf, nil)
+	users, err := loadUserStore(db.Dir())
+	if err != nil {
+		return err
+	}
+	return serveHTTP(ctx, db, *addr, *token, users, log.Printf, nil)
+}
+
+// loadUserStore 只在 users.json 存在时启用用户体系，
+// 避免默认的免鉴权 serve 变成所有请求 401。
+func loadUserStore(dir string) (*server.UserStore, error) {
+	path := filepath.Join(dir, "users.json")
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	} else if err != nil {
+		return nil, err
+	}
+	return server.OpenUserStore(path)
+}
+
+// runUserCommand 管理 HTTP 账号，直接读写 <数据目录>/users.json。
+func runUserCommand(path string, args []string, out io.Writer) error {
+	store, err := server.OpenUserStore(path)
+	if err != nil {
+		return err
+	}
+	sub := ""
+	if len(args) > 0 {
+		sub = args[0]
+	}
+	switch sub {
+	case "add":
+		if len(args) < 2 {
+			return errors.New("用法: user add <名字> [admin|write|read] [集合1,集合2]")
+		}
+		role := server.RoleWrite
+		if len(args) > 2 {
+			role = args[2]
+		}
+		var colls []string
+		if len(args) > 3 {
+			colls = strings.Split(args[3], ",")
+		}
+		u, err := store.Add(args[1], role, colls)
+		if err != nil {
+			return err
+		}
+		return printJSON(out, u)
+	case "list":
+		if len(args) > 1 {
+			return errors.New("用法: user list")
+		}
+		return printJSON(out, store.List())
+	case "remove", "delete":
+		if len(args) < 2 {
+			return errors.New("用法: user remove <名字>")
+		}
+		if err := store.Remove(args[1]); err != nil {
+			return err
+		}
+		return printJSON(out, map[string]any{"deleted": args[1]})
+	default:
+		return errors.New("用法: user add|list|remove ...")
+	}
 }
 
 // serveHTTP 启动 HTTP 服务并等待 ctx 取消或服务退出；ready 用于测试回调实际监听地址。
-func serveHTTP(ctx context.Context, db *engine.DB, addr, token string, logf func(string, ...any), ready func(string)) error {
+func serveHTTP(ctx context.Context, db *engine.DB, addr, token string, users *server.UserStore, logf func(string, ...any), ready func(string)) error {
 	if logf == nil {
 		logf = log.Printf
 	}
@@ -579,7 +674,7 @@ func serveHTTP(ctx context.Context, db *engine.DB, addr, token string, logf func
 	if err != nil {
 		return err
 	}
-	api := server.New(db, token)
+	api := server.NewWithOptions(db, server.Options{Token: token, Users: users})
 	defer api.Close()
 	srv := &http.Server{
 		Handler:           api,
