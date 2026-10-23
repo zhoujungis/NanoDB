@@ -69,12 +69,16 @@ type collection struct {
 	docs    map[string]map[string]any
 	ids     []string
 	indexes map[string]*index
+	texts   map[string]*textIndex
+	geos    map[string]*geoIndex
 }
 
 func newCollection() *collection {
 	return &collection{
 		docs:    make(map[string]map[string]any),
 		indexes: make(map[string]*index),
+		texts:   make(map[string]*textIndex),
+		geos:    make(map[string]*geoIndex),
 	}
 }
 
@@ -97,7 +101,28 @@ func (c *collection) add(id string, doc map[string]any) error {
 	for _, ix := range c.indexes {
 		ix.add(id, doc)
 	}
+	c.addAux(id, doc)
 	return nil
+}
+
+// addAux 维护文本与地理索引。
+func (c *collection) addAux(id string, doc map[string]any) {
+	for _, tx := range c.texts {
+		tx.add(id, doc)
+	}
+	for _, gx := range c.geos {
+		gx.add(id, doc)
+	}
+}
+
+// removeAux 从文本与地理索引中删除文档。
+func (c *collection) removeAux(id string, doc map[string]any) {
+	for _, tx := range c.texts {
+		tx.remove(id, doc)
+	}
+	for _, gx := range c.geos {
+		gx.remove(id)
+	}
 }
 
 // upsert 写入文档；已存在时按替换处理。用于 WAL 重放与批量操作。
@@ -116,10 +141,12 @@ func (c *collection) replace(id string, oldDoc, newDoc map[string]any) error {
 	for _, ix := range c.indexes {
 		ix.remove(id, oldDoc)
 	}
+	c.removeAux(id, oldDoc)
 	c.docs[id] = newDoc
 	for _, ix := range c.indexes {
 		ix.add(id, newDoc)
 	}
+	c.addAux(id, newDoc)
 	return nil
 }
 
@@ -140,6 +167,7 @@ func (c *collection) remove(id string) {
 	for _, ix := range c.indexes {
 		ix.remove(id, doc)
 	}
+	c.removeAux(id, doc)
 	delete(c.docs, id)
 	for i, x := range c.ids {
 		if x == id {
@@ -159,6 +187,7 @@ type walRecord struct {
 	Field  string         `json:"field,omitempty"`
 	Fields []string       `json:"fields,omitempty"`
 	Unique bool           `json:"unique,omitempty"`
+	Type   string         `json:"type,omitempty"`
 }
 
 type snapshotData struct {
@@ -253,11 +282,9 @@ func (db *DB) loadSnapshot() error {
 			if err != nil {
 				return fmt.Errorf("nanodb: snapshot index in %q: %w", name, err)
 			}
-			ix, err := buildIndex(c, spec)
-			if err != nil {
+			if err := c.attachIndex(spec); err != nil {
 				return fmt.Errorf("nanodb: rebuild index %q on %q: %w", spec.Field, name, err)
 			}
-			c.indexes[spec.Field] = ix
 		}
 	}
 	return nil
@@ -348,22 +375,19 @@ func (db *DB) applyRecord(rec walRecord) error {
 			}
 		}
 	case "index.create":
-		spec, err := normalizeIndexSpec(IndexSpec{Field: rec.Field, Fields: rec.Fields, Unique: rec.Unique})
+		spec, err := normalizeIndexSpec(IndexSpec{Field: rec.Field, Fields: rec.Fields, Unique: rec.Unique, Type: rec.Type})
 		if err != nil {
 			return fmt.Errorf("nanodb: wal index record: %w", err)
 		}
 		c := db.getCollection(rec.Coll)
-		if _, exists := c.indexes[spec.Field]; exists {
-			return nil
-		}
-		ix, err := buildIndex(c, spec)
-		if err != nil {
+		if err := c.attachIndex(spec); err != nil {
 			return fmt.Errorf("nanodb: replay index %q on %q: %w", spec.Field, rec.Coll, err)
 		}
-		c.indexes[spec.Field] = ix
 	case "index.drop":
 		if c := db.colls[rec.Coll]; c != nil {
 			delete(c.indexes, rec.Field)
+			delete(c.texts, rec.Field)
+			delete(c.geos, rec.Field)
 		}
 	default:
 		return fmt.Errorf("nanodb: unknown wal op %q", rec.Op)

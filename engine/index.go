@@ -8,24 +8,35 @@ import (
 	"strings"
 )
 
+// 索引类型。空字符串表示普通的标量/复合索引。
+const (
+	IndexTypeBTree = ""
+	IndexTypeText  = "text"
+	IndexTypeGeo   = "geo"
+)
+
 // IndexSpec 描述一个二级索引。Fields 长度为 1 时是单字段索引，
 // 大于 1 时是复合索引；Field 保存逗号拼接的字段名，兼容旧格式。
+// Type 为空表示普通索引，"text" 为全文索引（字段固定为 "*"），
+// "geo" 为地理位置索引（单字段）。
 type IndexSpec struct {
 	Field  string   `json:"field"`
 	Fields []string `json:"fields,omitempty"`
 	Unique bool     `json:"unique"`
+	Type   string   `json:"type,omitempty"`
 }
 
 // MarshalJSON 保持单字段索引 {"field":"age"} 的旧输出，
-// 复合索引额外带出 fields 数组。
+// 复合索引额外带出 fields 数组，文本/地理索引额外带出 type。
 func (s IndexSpec) MarshalJSON() ([]byte, error) {
 	fields := s.fieldList()
 	type wire struct {
 		Field  string   `json:"field"`
 		Fields []string `json:"fields,omitempty"`
 		Unique bool     `json:"unique"`
+		Type   string   `json:"type,omitempty"`
 	}
-	w := wire{Field: strings.Join(fields, ","), Unique: s.Unique}
+	w := wire{Field: strings.Join(fields, ","), Unique: s.Unique, Type: s.Type}
 	if len(fields) > 1 {
 		w.Fields = fields
 	}
@@ -49,12 +60,39 @@ func (s IndexSpec) fieldList() []string {
 
 // normalizeIndexSpec 校验索引定义并统一 Field/Fields 两种写法。
 func normalizeIndexSpec(spec IndexSpec) (IndexSpec, error) {
+	typ := strings.ToLower(strings.TrimSpace(spec.Type))
+	switch typ {
+	case IndexTypeBTree, IndexTypeText, IndexTypeGeo:
+	default:
+		return IndexSpec{}, fmt.Errorf("%w: unknown index type %q", ErrInvalid, spec.Type)
+	}
 	fields := spec.fieldList()
+	if typ == IndexTypeText {
+		if len(fields) != 1 || fields[0] != "*" {
+			return IndexSpec{}, fmt.Errorf("%w: text index must be created on field %q", ErrInvalid, "*")
+		}
+		if spec.Unique {
+			return IndexSpec{}, fmt.Errorf("%w: text index cannot be unique", ErrInvalid)
+		}
+		return IndexSpec{Field: "*", Fields: []string{"*"}, Type: typ}, nil
+	}
+	if typ == IndexTypeGeo {
+		if len(fields) != 1 {
+			return IndexSpec{}, fmt.Errorf("%w: geo index requires exactly one field", ErrInvalid)
+		}
+		if spec.Unique {
+			return IndexSpec{}, fmt.Errorf("%w: geo index cannot be unique", ErrInvalid)
+		}
+		return IndexSpec{Field: fields[0], Fields: fields, Type: typ}, nil
+	}
 	if len(fields) == 0 {
 		return IndexSpec{}, fmt.Errorf("%w: empty index field", ErrInvalid)
 	}
 	seen := make(map[string]struct{}, len(fields))
 	for _, f := range fields {
+		if f == "*" {
+			return IndexSpec{}, fmt.Errorf("%w: field %q is reserved for text indexes", ErrInvalid, f)
+		}
 		if _, dup := seen[f]; dup {
 			return IndexSpec{}, fmt.Errorf("%w: duplicate index field %q", ErrInvalid, f)
 		}
@@ -595,11 +633,22 @@ func buildIndex(c *collection, spec IndexSpec) (*index, error) {
 }
 
 func (c *collection) indexSpecs() []IndexSpec {
-	specs := make([]IndexSpec, 0, len(c.indexes))
+	specs := make([]IndexSpec, 0, len(c.indexes)+len(c.texts)+len(c.geos))
 	for _, ix := range c.indexes {
 		specs = append(specs, IndexSpec{Field: ix.name(), Fields: ix.fields, Unique: ix.unique})
 	}
-	sort.Slice(specs, func(i, j int) bool { return specs[i].Field < specs[j].Field })
+	for name := range c.texts {
+		specs = append(specs, IndexSpec{Field: name, Fields: []string{name}, Type: IndexTypeText})
+	}
+	for field := range c.geos {
+		specs = append(specs, IndexSpec{Field: field, Fields: []string{field}, Type: IndexTypeGeo})
+	}
+	sort.Slice(specs, func(i, j int) bool {
+		if specs[i].Field != specs[j].Field {
+			return specs[i].Field < specs[j].Field
+		}
+		return specs[i].Type < specs[j].Type
+	})
 	return specs
 }
 
@@ -614,7 +663,49 @@ func (c *collection) clone() *collection {
 	for name, ix := range c.indexes {
 		nc.indexes[name] = ix.clone()
 	}
+	for name, tx := range c.texts {
+		nc.texts[name] = tx.clone()
+	}
+	for field, gx := range c.geos {
+		nc.geos[field] = gx.clone()
+	}
 	return nc
+}
+
+// attachIndex 把索引定义挂到集合上，用于快照加载与 WAL 重放。
+func (c *collection) attachIndex(spec IndexSpec) error {
+	switch spec.Type {
+	case IndexTypeText:
+		if c.texts[spec.Field] == nil {
+			c.texts[spec.Field] = buildTextIndex(c)
+		}
+	case IndexTypeGeo:
+		if _, exists := c.geos[spec.Field]; !exists {
+			c.geos[spec.Field] = buildGeoIndex(c, spec.Field)
+		}
+	default:
+		if _, exists := c.indexes[spec.Field]; exists {
+			return nil
+		}
+		ix, err := buildIndex(c, spec)
+		if err != nil {
+			return err
+		}
+		c.indexes[spec.Field] = ix
+	}
+	return nil
+}
+
+// indexNameInUse 判断索引名是否已被任意类型的索引占用。
+func (c *collection) indexNameInUse(name string) bool {
+	if _, ok := c.indexes[name]; ok {
+		return true
+	}
+	if _, ok := c.texts[name]; ok {
+		return true
+	}
+	_, ok := c.geos[name]
+	return ok
 }
 
 // collectConditions 收集顶层与 $and 中的字段条件；$or/$not 无法安全地取候选集。
@@ -639,7 +730,7 @@ func collectConditions(filter map[string]any, out map[string][]any) {
 
 // planCandidates 从过滤条件中挑选候选集最小的索引，返回 nil 表示走全表扫描。
 func (c *collection) planCandidates(filter map[string]any) map[string]struct{} {
-	if filter == nil || len(c.indexes) == 0 {
+	if filter == nil || (len(c.indexes) == 0 && len(c.texts) == 0 && len(c.geos) == 0) {
 		return nil
 	}
 	conds := make(map[string][]any, len(filter))
@@ -648,20 +739,33 @@ func (c *collection) planCandidates(filter map[string]any) map[string]struct{} {
 		return nil
 	}
 	var best map[string]struct{}
-	for _, ix := range c.indexes {
-		ids := ix.lookup(conds)
+	consider := func(ids map[string]struct{}) {
 		if ids == nil {
-			continue
+			return
 		}
 		if best == nil || len(ids) < len(best) {
 			best = ids
 		}
 	}
+	for _, ix := range c.indexes {
+		consider(ix.lookup(conds))
+	}
+	for _, tx := range c.texts {
+		consider(tx.lookup(conds["$text"]))
+	}
+	for field, gx := range c.geos {
+		consider(gx.lookup(conds[field]))
+	}
 	return best
 }
 
-// CreateIndex 创建二级索引；字段用逗号分隔时创建复合索引。
+// CreateIndex 创建普通二级索引；字段用逗号分隔时创建复合索引。
 func (db *DB) CreateIndex(coll, field string, unique bool) error {
+	return db.CreateIndexSpec(coll, IndexSpec{Field: field, Unique: unique})
+}
+
+// CreateIndexSpec 按完整定义创建索引，支持普通、复合、文本与地理索引。
+func (db *DB) CreateIndexSpec(coll string, spec IndexSpec) error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 	if err := db.checkOpen(); err != nil {
@@ -670,30 +774,38 @@ func (db *DB) CreateIndex(coll, field string, unique bool) error {
 	if strings.TrimSpace(coll) == "" {
 		return fmt.Errorf("%w: empty collection name", ErrInvalid)
 	}
-	if strings.TrimSpace(field) == "" {
-		return fmt.Errorf("%w: empty index field", ErrInvalid)
-	}
-	spec, err := normalizeIndexSpec(IndexSpec{Field: field, Unique: unique})
+	spec, err := normalizeIndexSpec(spec)
 	if err != nil {
 		return err
 	}
 	c := db.getCollection(coll)
 	name := spec.Field
-	if ix, exists := c.indexes[name]; exists {
-		if ix.unique == unique {
-			return nil
+	if c.indexNameInUse(name) {
+		switch spec.Type {
+		case IndexTypeText:
+			if c.texts[name] != nil {
+				return nil
+			}
+		case IndexTypeGeo:
+			if _, exists := c.geos[name]; exists {
+				return nil
+			}
+		default:
+			if ix, exists := c.indexes[name]; exists && ix.unique == spec.Unique {
+				return nil
+			}
 		}
 		return fmt.Errorf("%w: index on %q already exists with different options", ErrInvalid, name)
 	}
-	ix, err := buildIndex(c, spec)
-	if err != nil {
+	if err := c.attachIndex(spec); err != nil {
 		return err
 	}
 	// 先登记内存索引再写 WAL，避免写成功后的自动压缩丢掉索引定义。
-	c.indexes[name] = ix
-	rec := walRecord{Op: "index.create", Coll: coll, Field: name, Fields: spec.Fields, Unique: unique}
+	rec := walRecord{Op: "index.create", Coll: coll, Field: name, Fields: spec.Fields, Unique: spec.Unique, Type: spec.Type}
 	if err := db.appendRecord(rec); err != nil {
 		delete(c.indexes, name)
+		delete(c.texts, name)
+		delete(c.geos, name)
 		return err
 	}
 	db.touchLocked(coll)
@@ -712,13 +824,15 @@ func (db *DB) DropIndex(coll, field string) error {
 	if c == nil {
 		return nil
 	}
-	if _, exists := c.indexes[field]; !exists {
+	if !c.indexNameInUse(field) {
 		return nil
 	}
 	if err := db.appendRecord(walRecord{Op: "index.drop", Coll: coll, Field: field}); err != nil {
 		return err
 	}
 	delete(c.indexes, field)
+	delete(c.texts, field)
+	delete(c.geos, field)
 	db.touchLocked(coll)
 	db.maybeCompactLocked()
 	return nil

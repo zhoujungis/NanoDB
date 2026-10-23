@@ -85,10 +85,13 @@ func usage() {
        -sort 字段:-1,...  -limit N  -skip N  -fields 字段1,字段2
   count <集合> [过滤JSON]         统计文档数量
   aggregate <集合> <管道JSON|->   执行聚合管道，支持 $match/$group/$sort/$skip/$limit/$project/$unwind/$count
+  sql <语句|->                    执行只读 SQL（SELECT/WHERE/ORDER BY/LIMIT/OFFSET/COUNT(*)）
   update <集合> <id> <更新JSON>   更新文档，支持 $set/$unset/$inc/$push/$pull/$addToSet
   delete <集合> <id>              删除单个文档
   drop <集合>                     删除整个集合
   index create <集合> <字段[,字段2...]> [unique]  创建二级索引；逗号分隔为复合索引
+  index create <集合> * text      创建全文索引（覆盖所有字符串字段，查询用 $text）
+  index create <集合> <字段> geo   创建地理索引（查询用 $geoWithin）
   index drop <集合> <字段[,字段2...]>    删除索引
   index list <集合>               查看索引
   batch <操作JSON数组|->          原子批量写入；- 表示从标准输入读取
@@ -105,6 +108,9 @@ func usage() {
   nanodb -db ./data find users '{"age":{"$gte":18}}' -sort age:-1 -limit 10
   nanodb -db ./data update users <id> '{"$inc":{"age":1}}'
   nanodb -db ./data index create users age
+  nanodb -db ./data index create users * text
+  nanodb -db ./data index create users location geo
+  nanodb -db ./data sql 'SELECT name, age FROM users WHERE age >= 18 ORDER BY age DESC LIMIT 10'
   nanodb -db ./data batch '[{"op":"insert","coll":"users","doc":{"name":"A"}},{"op":"insert","coll":"users","doc":{"name":"B"}}]'
   nanodb -db ./data serve -addr :8080 -token secret
 
@@ -129,7 +135,7 @@ type dataStore interface {
 
 func isDataCommand(cmd string) bool {
 	switch cmd {
-	case "put", "get", "find", "count", "update", "delete", "batch":
+	case "put", "get", "find", "count", "update", "delete", "batch", "sql":
 		return true
 	default:
 		return false
@@ -198,6 +204,26 @@ func dispatch(s dataStore, db *engine.DB, in io.Reader, out, errOut io.Writer, c
 		}
 		return printJSON(out, map[string]any{"count": n})
 
+	case "sql":
+		if len(args) < 1 {
+			return errors.New("用法: sql 'SELECT ... FROM 集合 [WHERE ...] [ORDER BY ...] [LIMIT N]'，用 - 从标准输入读取")
+		}
+		var stmt string
+		if args[0] == "-" {
+			data, err := io.ReadAll(in)
+			if err != nil {
+				return fmt.Errorf("读取标准输入失败: %w", err)
+			}
+			stmt = string(data)
+		} else {
+			stmt = strings.Join(args, " ")
+		}
+		docs, err := engine.RunSQL(s, stmt)
+		if err != nil {
+			return err
+		}
+		return printJSON(out, docs)
+
 	case "update":
 		if len(args) < 3 {
 			return errors.New(`用法: update <集合> <id> '{"$set":{"字段":值}}'`)
@@ -244,13 +270,35 @@ func dispatch(s dataStore, db *engine.DB, in io.Reader, out, errOut io.Writer, c
 		switch args[0] {
 		case "create":
 			if len(args) < 3 {
-				return errors.New("用法: index create <集合> <字段[,字段2...]> [unique]")
+				return errors.New("用法: index create <集合> <字段[,字段2...]|*> [unique|text|geo]")
 			}
-			unique := len(args) > 3 && (args[3] == "unique" || args[3] == "true" || args[3] == "1")
-			if err := db.CreateIndex(args[1], args[2], unique); err != nil {
+			option := ""
+			if len(args) > 3 {
+				option = strings.ToLower(args[3])
+			}
+			spec := engine.IndexSpec{Field: args[2]}
+			switch option {
+			case "":
+			case engine.IndexTypeText, engine.IndexTypeGeo:
+				spec.Type = option
+			case "unique", "true", "1":
+				spec.Unique = true
+			case "false", "0":
+			default:
+				return fmt.Errorf("未知索引选项 %q（可用 unique、text、geo）", args[3])
+			}
+			if err := db.CreateIndexSpec(args[1], spec); err != nil {
 				return err
 			}
-			return printJSON(out, map[string]any{"created": true, "field": args[2], "unique": unique})
+			field := args[2]
+			if spec.Type == engine.IndexTypeText {
+				field = "*"
+			}
+			result := map[string]any{"created": true, "field": field, "unique": spec.Unique}
+			if spec.Type != "" {
+				result["type"] = spec.Type
+			}
+			return printJSON(out, result)
 		case "drop":
 			if len(args) < 3 {
 				return errors.New("用法: index drop <集合> <字段>")

@@ -18,7 +18,9 @@ NanoDB 是一个用 Go 编写的轻量级嵌入式文档数据库（NoSQL），�
 - [查询](#查询)
 - [更新](#更新)
 - [二级索引](#二级索引)
+- [文本与地理索引](#文本与地理索引)
 - [聚合管道](#聚合管道)
+- [SQL 只读查询](#sql-只读查询)
 - [原子批量写入](#原子批量写入)
 - [显式事务](#显式事务)
 - [命令行](#命令行)
@@ -37,6 +39,8 @@ NanoDB 是一个用 Go 编写的轻量级嵌入式文档数据库（NoSQL），�
 - **持久化**：快照 + 预写日志（WAL）；默认每次写入 `fsync`；WAL 超过阈值自动压缩；崩溃后自动重放，尾部撕裂记录会被安全截断。
 - **查询**：字段等值、比较、集合、存在性、正则、逻辑组合；支持多字段排序、分页和字段投影；排序键预抽取，带 `limit` 的排序自动走 Top-N，避免全量排序。
 - **二级索引**：单字段或复合索引（`a,b`），支持等值、`$in`、范围查询和数组 multikey；可为索引添加唯一约束；查询计划自动选择候选集最小的索引。
+- **文本与地理索引**：全文索引覆盖文档内所有字符串（含中文二元组），用 `$text` 搜索；地理索引按经度有序存储，支持 `$geoWithin` 的 `$box` 与米制 `$circle`。
+- **SQL 只读查询**：`SELECT ... FROM ... WHERE ... ORDER BY ... LIMIT/OFFSET` 与 `COUNT(*)`，复用同一套过滤、索引与排序实现。
 - **聚合管道**：`$match`、`$group`、`$sort`、`$skip`、`$limit`、`$project`、`$unwind`、`$count`，支持 `$sum/$avg/$min/$max/$first/$last/$push` 累加器。
 - **原子批量写入**：一组写操作要么全部生效，要么全部不生效，成功时只落一条 WAL 记录。
 - **显式事务**：`Begin` / `Commit` / `Rollback`，集合快照读 + 提交时冲突检测，详见 [事务隔离级别说明](docs/transaction-isolation.md)。
@@ -247,6 +251,9 @@ CLI 写法：
 | `$exists` | `true` 表示字段存在，`false` 表示字段缺失 | 按实际存在性判断 |
 | `$regex` | Go 正则匹配字符串 | 不匹配 |
 | `$not` | 对字段条件取反（如 `{"$not":{"$gt":10}}`） | 取反后判断 |
+| `$geoWithin` | 坐标落在 `$box` / `$circle` 内（字段级，见[文本与地理索引](#文本与地理索引)） | 不匹配 |
+
+顶层条件 `$text` 用于全文搜索（见[文本与地理索引](#文本与地理索引)），写法为 `{"$text":"关键词"}` 或 `{"$text":{"$search":"关键词","$path":"字段"}}`。
 
 补充语义：
 
@@ -350,6 +357,8 @@ docs, err := db.Find("users", engine.Query{
 ./bin/nanodb -db ./data index create users age          # 普通索引
 ./bin/nanodb -db ./data index create users email unique # 唯一索引
 ./bin/nanodb -db ./data index create users age,name     # 复合索引
+./bin/nanodb -db ./data index create users '*' text     # 文本索引（字段固定为 *）
+./bin/nanodb -db ./data index create users location geo # 地理索引
 ./bin/nanodb -db ./data index list users
 ./bin/nanodb -db ./data index drop users age
 ./bin/nanodb -db ./data index drop users age,name
@@ -415,7 +424,46 @@ $ ./bin/nanodb -db ./data index list users
 - 索引条目常驻内存，内存占用约为“文档数 × 索引数 × 单条索引项”。
 - 低选择性字段（例如只有 `true/false` 的布尔字段）建索引收益有限，通常不如全表扫描。
 
-限制：暂不支持文本索引、地理索引、索引覆盖查询和 `$not` 索引优化；聚合管道不参与索引规划，始终从集合全部文档开始。
+限制：暂不支持索引覆盖查询和 `$not` 索引优化；文本与地理索引只会在顶层条件或 `$and` 子条件中参与候选集，`$or` / `$not` 下回退全表扫描；聚合管道不参与索引规划，始终从集合全部文档开始。
+
+## 文本与地理索引
+
+索引类型通过 `type` 区分：普通（空）、复合、`text`、`geo`。CLI 第四个参数、HTTP body 的 `type`、Go 的 `IndexSpec.Type` 均可指定。
+
+文本索引：
+
+```bash
+./bin/nanodb -db ./data index create users '*' text
+./bin/nanodb -db ./data find users '{"$text":"数据库 工程师"}'
+./bin/nanodb -db ./data find users '{"$text":{"$search":"database","$path":"profile.bio"}}'
+```
+
+- 文本索引字段固定为 `*`，覆盖文档中所有字符串值，包括嵌套对象与数组里的字符串；不能建唯一索引。
+- 分词按 unicode 字母/数字切分并转小写；纯汉字片段额外拆成相邻二元组，因此「数据库」可以命中「数据库工程师」。查询中的多个词元是 **AND** 关系。
+- 查询写法：`{"$text":"关键词"}`，或 `{"$search":"关键词","$path":"字段"|["字段1","字段2"]}`。`$path` 只在回表匹配阶段限定字段，索引本身仍是全字段倒排。
+- 建索引前后查询语义一致：没有文本索引时逐文档匹配，有索引时先取倒排候选集再回表校验（索引候选集是超集）。
+- 插入、更新、删除会同步维护倒排；`Compact` 与重启后自动重建。
+
+地理索引：
+
+```bash
+./bin/nanodb -db ./data index create users location geo
+
+# 矩形范围（经纬度两个角点，顺序不限）
+./bin/nanodb -db ./data find users \
+  '{"location":{"$geoWithin":{"$box":[[116.3,39.8],[116.5,40.0]]}}}'
+
+# 圆形范围（半径单位：米）
+./bin/nanodb -db ./data find users \
+  '{"location":{"$geoWithin":{"$circle":{"$center":[116.4,39.9],"$radius":5000}}}}'
+```
+
+- 只支持单字段，不能复合、不能唯一。
+- 坐标支持 `[经度, 纬度]` 数组或 GeoJSON `{"type":"Point","coordinates":[lon,lat]}`；经度范围 `[-180,180]`、纬度 `[-90,90]`，无效坐标不会进入索引，也不会匹配。
+- `$box` 内部按 min/max 归一；`$circle` 的 `$radius` 单位为米，使用 haversine 球面距离。
+- 索引按经度有序存储，查询先二分出经度区间，再按纬度（圆形还按距离）过滤；该地理条件可与普通过滤条件组合。
+- `$geoWithin` 不按距离排序；需要按距离/坐标排序时显式带 `sort`。
+- 不支持多边形；跨 180° 经线的 `$box` / `$circle` 不保证正确。
 
 ## 聚合管道
 
@@ -487,6 +535,59 @@ CLI：
   }
 ]
 ```
+
+## SQL 只读查询
+
+CLI：
+
+```bash
+./bin/nanodb -db ./data sql "SELECT name, age FROM users WHERE age >= 18 AND city = 'Shanghai' ORDER BY age DESC LIMIT 10 OFFSET 5"
+
+# 从标准输入读取
+echo "SELECT COUNT(*) FROM users WHERE active = true" | ./bin/nanodb -db ./data sql -
+```
+
+HTTP：
+
+```bash
+curl -X POST localhost:8080/v1/sql \
+  -H 'X-NanoDB-Token: secret' -H 'Content-Type: application/json' \
+  -d '{"query":"SELECT name FROM users WHERE age >= 18 ORDER BY name LIMIT 5"}'
+```
+
+Go：`db.QuerySQL(stmt)`，或对 `*DB` / `*Tx` 调用 `engine.RunSQL(store, stmt)`。
+
+语法：
+
+```sql
+SELECT * | 字段[, 字段...] | COUNT(*)
+FROM 集合
+[WHERE 条件]
+[ORDER BY 字段 [ASC|DESC][, ...]]
+[LIMIT n] [OFFSET n]
+```
+
+WHERE 支持的形式：
+
+| 形式 | 说明 |
+|---|---|
+| `=`、`!=`、`<>`、`>`、`>=`、`<`、`<=` | 映射到 `$eq/$ne/$gt/$gte/$lt/$lte` |
+| `AND` / `OR` / `NOT` / 括号 | 与 JSON 过滤的 `$and/$or/$not` 等价 |
+| `IS NULL` / `IS NOT NULL` | 等价于 `$eq: null`（含字段缺失）/ `$exists: true` |
+| `[NOT] IN (值, ...)` | 值列表 |
+| `[NOT] LIKE '模式'` | `%` 匹配任意长度，`_` 匹配单个字符；整体锚定，大小写敏感 |
+| `[NOT] BETWEEN a AND b` | 闭区间，等价于 `>= a AND <= b` |
+
+字面量支持数字（含负数）、单引号字符串（`''` 表示单引号）、`NULL`、`TRUE`、`FALSE`；标识符可以是裸标识符、双引号标识符，或用点号访问嵌套字段（如 `profile.city`）。
+
+语义与限制：
+
+- SQL 只生成一个 `engine.Query`，因此索引规划、排序、Top-N、投影与普通查询完全一致。
+- `COUNT(*)` 只返回 `[{"count":n}]`，忽略 `ORDER BY` / `LIMIT` / `OFFSET`，且不能与其他列组合。
+- `LIMIT 0` 返回空数组；`LIMIT` / `OFFSET` 必须是非负整数。
+- 只读：`INSERT` / `UPDATE` / `DELETE` 与任何 DDL 都会返回参数错误（HTTP `400`）。
+- 不支持 JOIN、`GROUP BY`、`HAVING`、`DISTINCT`、子查询、`UNION`、列别名以及 `COUNT(*)` 以外的聚合函数。
+- CLI 在事务内也可执行（只读）；HTTP 的 `read` 角色允许调用，服务端解析出真实集合后再校验集合白名单。
 
 ## 原子批量写入
 
@@ -606,10 +707,11 @@ get <集合> <id>                 读取单个文档
 find <集合> [过滤JSON]          查询文档（-sort/-limit/-skip/-fields）
 count <集合> [过滤JSON]         统计文档数量
 aggregate <集合> <管道JSON|->   执行聚合管道；- 表示从标准输入读取
+sql <语句|->                    执行只读 SQL；- 表示从标准输入读取
 update <集合> <id> <更新JSON>   更新文档
 delete <集合> <id>              删除单个文档
 drop <集合>                     删除整个集合
-index create <集合> <字段[,字段2...]> [unique]  创建单字段或复合索引；unique 表示唯一索引
+index create <集合> <字段[,字段2...]|*> [unique|text|geo]  创建索引；type 为 text 时字段必须写 *
 index drop <集合> <字段[,字段2...]>  删除索引
 index list <集合>               查看索引
 batch <操作JSON数组|->          原子批量写入；- 表示从标准输入读取
@@ -641,6 +743,9 @@ help                            显示帮助
   -sort age:-1,name:1 -skip 20 -limit 10 -fields name,age
 
 ./bin/nanodb -db ./data index create users email unique
+./bin/nanodb -db ./data index create users '*' text
+./bin/nanodb -db ./data index create users location geo
+./bin/nanodb -db ./data sql "SELECT name, age FROM users WHERE age >= 18 ORDER BY age DESC LIMIT 10"
 ./bin/nanodb -db ./data stats
 ```
 
@@ -653,9 +758,10 @@ help                            显示帮助
 | `find` | 文档数组；无命中时为 `[]` |
 | `count` | `{"count":n}` |
 | `aggregate` | 管道结果数组；无命中时为 `[]` |
+| `sql` | 查询结果数组；`COUNT(*)` 为 `[{"count":n}]` |
 | `update` | 更新后的完整文档 |
 | `delete` / `drop` | `{"deleted":true}` / `{"dropped":"集合名"}` |
-| `index create` | `{"created":true,"field":"age,name","unique":false}` |
+| `index create` | `{"created":true,"field":"age,name","unique":false}`；文本/地理索引额外带 `"type":"text"` / `"type":"geo"` |
 | `index drop` | `{"dropped":"字段名"}` |
 | `index list` | 索引定义数组 |
 | `batch` | 每步结果的数组 |
@@ -733,9 +839,10 @@ nano> exit
 | PATCH | `/v1/{coll}/{id}` | 按更新操作符修改文档 |
 | DELETE | `/v1/{coll}/{id}` | 删除文档，返回 `{"deleted":true}` |
 | GET | `/v1/indexes/{coll}` | 列出索引 |
-| POST | `/v1/indexes/{coll}` | 创建索引，body：`{"field":"age","unique":false}`；复合索引写 `{"fields":["age","name"],"unique":true}` |
+| POST | `/v1/indexes/{coll}` | 创建索引，body：`{"field":"age","unique":false}`；复合索引写 `{"fields":["age","name"],"unique":true}`；文本索引写 `{"field":"*","type":"text"}`，地理索引写 `{"field":"location","type":"geo"}` |
 | DELETE | `/v1/indexes/{coll}/{field}` | 删除索引，返回 `{"dropped":field}`；复合索引用逗号写字段名，如 `age,name` |
 | POST | `/v1/aggregate/{coll}` | 执行聚合管道，body：`{"pipeline":[...]}` |
+| POST | `/v1/sql` | 执行只读 SQL，body：`{"query":"SELECT ... FROM ..."}` |
 | POST | `/v1/batch` | 原子批量写入 |
 | GET | `/v1/admin/stats` | 统计信息 |
 | POST | `/v1/admin/compact` | 压缩存储，返回 `{"compacted":true}` |
@@ -760,11 +867,11 @@ nano> exit
 
 | 角色 | 允许 |
 |---|---|
-| `read` | 所有 GET/HEAD/OPTIONS：查询、读取、集合列表、索引列表 |
+| `read` | 所有 GET/HEAD/OPTIONS：查询、读取、集合列表、索引列表；以及只读的 `POST /v1/sql` |
 | `write` | `read` 的全部 + 文档写入、按条件删除、批量、事务、聚合 |
 | `admin` | 全部，包括 `/v1/admin/*`（stats、compact、账号管理）、索引创建/删除、删除集合 |
 
-- 集合白名单 `collections` 为空表示可访问全部集合；非空时，CRUD、聚合、索引、事务文档路径都只能访问列出的集合，`/v1/batch` 会逐条校验每个操作的 `coll`。
+- 集合白名单 `collections` 为空表示可访问全部集合；非空时，CRUD、聚合、索引、事务文档路径都只能访问列出的集合，`/v1/batch` 会逐条校验每个操作的 `coll`，`/v1/sql` 在解析出真实集合后校验。
 - 未通过鉴权返回 `401`；已鉴权但角色或集合不允许返回 `403`。
 - 账号 token 由服务端生成（32 字节随机数的 64 位十六进制），只在创建时返回，请立即保存。
 - `users.json` 权限为 `0600`，写入采用临时文件 + 原子重命名；服务端按文件修改时间自动重载，手工编辑或 `user` 命令修改都会在下次请求时生效。
@@ -842,6 +949,19 @@ curl -G -X DELETE localhost:8080/v1/users --data-urlencode 'filter={"age":{"$lt"
 curl -X POST localhost:8080/v1/indexes/users \
   -H 'Content-Type: application/json' \
   -d '{"field":"email","unique":true}'
+
+# 创建文本 / 地理索引
+curl -X POST localhost:8080/v1/indexes/users -H 'Content-Type: application/json' -d '{"field":"*","type":"text"}'
+curl -X POST localhost:8080/v1/indexes/users -H 'Content-Type: application/json' -d '{"field":"location","type":"geo"}'
+
+# 全文 / 地理范围查询（filter 需 URL 编码，见上面查询示例）
+curl -G localhost:8080/v1/users --data-urlencode 'filter={"$text":"数据库"}'
+curl -G localhost:8080/v1/users \
+  --data-urlencode 'filter={"location":{"$geoWithin":{"$circle":{"$center":[116.4,39.9],"$radius":5000}}}}'
+
+# 只读 SQL
+curl -X POST localhost:8080/v1/sql -H 'Content-Type: application/json' \
+  -d '{"query":"SELECT name, age FROM users WHERE age >= 18 ORDER BY age DESC LIMIT 10"}'
 
 # 原子批量
 curl -X POST localhost:8080/v1/batch \
@@ -1092,7 +1212,9 @@ func main() {
 | `DeleteMany(coll, filter)` | `(int, error)` | 按条件删除 |
 | `Batch(ops)` | `([]BatchResult, error)` | 原子批量 |
 | `Aggregate(coll, pipeline)` | `([]map[string]any, error)` | 执行聚合管道，返回结果副本 |
-| `CreateIndex(coll, field, unique)` | `error` | 创建索引；`field` 写 `"a,b"` 即为复合索引 |
+| `QuerySQL(stmt)` | `([]map[string]any, error)` | 执行只读 SQL；`COUNT(*)` 返回 `[{"count":n}]` |
+| `CreateIndex(coll, field, unique)` | `error` | 创建普通/复合索引；`field` 写 `"a,b"` 即为复合索引 |
+| `CreateIndexSpec(coll, spec)` | `error` | 按完整定义创建，`spec.Type` 可为 `IndexTypeText` / `IndexTypeGeo` |
 | `DropIndex(coll, field)` | `error` | 删除索引；不存在视为成功 |
 | `ListIndexes(coll)` | `[]IndexSpec` | 按字段名排序的索引列表 |
 | `DropCollection(coll)` | `error` | 删除集合；不存在视为成功 |
@@ -1150,6 +1272,30 @@ if err := db.CreateIndex("users", "email", true); err != nil {
 for _, ix := range db.ListIndexes("users") {
     fmt.Println(ix.Field, ix.Unique)
 }
+```
+
+文本、地理索引与 SQL：
+
+```go
+if err := db.CreateIndexSpec("users", engine.IndexSpec{Field: "*", Type: engine.IndexTypeText}); err != nil {
+    return err
+}
+if err := db.CreateIndexSpec("users", engine.IndexSpec{Field: "location", Type: engine.IndexTypeGeo}); err != nil {
+    return err
+}
+
+hits, err := db.Find("users", engine.Query{
+    Filter: map[string]any{"$text": "数据库 工程师"},
+})
+nearby, err := db.Find("users", engine.Query{
+    Filter: map[string]any{"location": map[string]any{
+        "$geoWithin": map[string]any{
+            "$circle": map[string]any{"$center": []any{116.4, 39.9}, "$radius": 5000},
+        },
+    }},
+})
+
+rows, err := db.QuerySQL("SELECT name FROM users WHERE age >= 18 ORDER BY age DESC LIMIT 10")
 ```
 
 ### 生命周期
@@ -1312,8 +1458,8 @@ go test ./engine -run '^$' -bench Benchmark -benchmem
 
 当前覆盖率约为：engine 80%、server 80%、cmd 75%。测试覆盖：
 
-- 引擎：CRUD、查询操作符、排序/分页/投影、单字段与复合索引及唯一约束、聚合管道、批量原子性、事务隔离与冲突、WAL 重放、压缩、目录锁、关闭后行为、更新错误路径。
-- server：鉴权、角色与集合白名单、账号存储、路由、405、参数校验、错误码、事务会话与超时回收、请求体上限。
+- 引擎：CRUD、查询操作符、排序/分页/投影、单字段/复合/文本/地理索引及唯一约束、聚合管道、SQL 解析与执行、批量原子性、事务隔离与冲突、WAL 重放、压缩、目录锁、关闭后行为、更新错误路径。
+- server：鉴权、角色与集合白名单、账号存储、路由、405、参数校验、错误码、事务会话与超时回收、请求体上限、SQL 接口与索引类型。
 - CLI：参数解析、一次性命令全链路、shell 事务与 EOF 回滚、serve 启停、user 命令。
 
 基准统一使用 10 万条文档；`BenchmarkFind*` 覆盖等值、范围、投影、分页与排序，`BenchmarkSortRandom*` 是随机序数据上的全量排序与 Top-N A/B。
@@ -1335,6 +1481,7 @@ NanoDB/
 │   ├── users.go                   # users.json 账号存储
 │   ├── server_test.go
 │   ├── auth_test.go
+│   ├── sql_test.go
 │   └── error_test.go
 └── engine/
     ├── db.go                      # 存储引擎、CRUD、WAL、快照、压缩、目录锁
@@ -1343,8 +1490,11 @@ NanoDB/
     ├── lock_unix.go               # Unix flock 实现
     ├── query.go                   # 过滤匹配、排序、投影
     ├── aggregate.go               # 聚合管道
+    ├── sql.go                     # SQL 只读子集的词法、语法与执行
     ├── update.go                  # 更新操作符
-    ├── index.go                   # 单字段与复合索引、查询计划
+    ├── index.go                   # 单字段/复合/文本/地理索引、查询计划
+    ├── text.go                    # 文本倒排索引与分词
+    ├── geo.go                     # 地理索引、$geoWithin 与 haversine
     ├── batch.go                   # 原子批量写入
     ├── tx.go                      # 显式事务
     ├── id.go                      # _id 生成
@@ -1353,6 +1503,8 @@ NanoDB/
     ├── query_test.go
     ├── aggregate_test.go
     ├── index_test.go
+    ├── text_geo_test.go
+    ├── sql_test.go
     ├── lock_test.go
     ├── batch_test.go
     ├── tx_test.go
@@ -1361,7 +1513,9 @@ NanoDB/
 
 ## 已知限制
 
-- 不支持 SQL、文本索引、地理索引。
+- 文本索引是近似全文检索：按字母/数字分词，汉字使用二元组，没有停用词、词干、同义词与相关度评分；多词为 AND 语义，结果不按相关度排序；索引字段固定为 `*`，无法只索引部分字段（查询可用 `$path` 限定）。
+- 地理索引只支持 `$box` 与 `$circle`，不支持多边形、GeoJSON 的 `Polygon` / `LineString`，也不处理跨 180° 经线的范围；`$geoWithin` 本身不按距离排序。
+- SQL 只支持单条只读 `SELECT`：没有 JOIN、`GROUP BY`、`HAVING`、`DISTINCT`、子查询、`UNION`、列别名，聚合只支持 `COUNT(*)`；`LIKE` 大小写敏感。
 - 不支持副本、分片或集群；同一目录同一时间只能被一个进程打开（由 `LOCK` 独占锁强制）。
 - 不支持 Savepoint、事务内 DDL（`drop`、`index create/drop`、`compact`）和跨进程事务。
 - 事务隔离级别固定，不可配置；冲突粒度是集合。

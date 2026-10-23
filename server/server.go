@@ -142,6 +142,8 @@ func (s *Server) serveV1(w http.ResponseWriter, r *http.Request, parts []string)
 		s.serveTransactions(w, r, parts[1:])
 	case "aggregate":
 		s.serveAggregate(w, r, parts[1:])
+	case "sql":
+		s.serveSQL(w, r, parts[1:])
 	default:
 		coll := parts[0]
 		switch len(parts) {
@@ -472,11 +474,11 @@ func (s *Server) serveIndexes(w http.ResponseWriter, r *http.Request, rest []str
 				writeError(w, http.StatusBadRequest, "field is required")
 				return
 			}
-			if err := s.db.CreateIndex(coll, field, spec.Unique); err != nil {
+			spec.Field = field
+			if err := s.db.CreateIndexSpec(coll, spec); err != nil {
 				writeDBError(w, err)
 				return
 			}
-			spec.Field = field
 			writeJSON(w, http.StatusCreated, spec)
 		default:
 			methodNotAllowed(w, "GET, POST")
@@ -515,6 +517,46 @@ func (s *Server) serveAggregate(w http.ResponseWriter, r *http.Request, rest []s
 		return
 	}
 	docs, err := s.db.Aggregate(rest[0], body.Pipeline)
+	if err != nil {
+		writeDBError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, docs)
+}
+
+// serveSQL 执行只读 SQL：
+//
+//	POST /v1/sql  body: {"query":"SELECT ... FROM ..."}
+func (s *Server) serveSQL(w http.ResponseWriter, r *http.Request, rest []string) {
+	if len(rest) != 0 {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodPost {
+		methodNotAllowed(w, "POST")
+		return
+	}
+	var body struct {
+		Query string `json:"query"`
+	}
+	if err := decodeBody(w, r, &body); err != nil {
+		writeDecodeError(w, err)
+		return
+	}
+	if strings.TrimSpace(body.Query) == "" {
+		writeError(w, http.StatusBadRequest, "query is required")
+		return
+	}
+	q, err := engine.ParseSQL(body.Query)
+	if err != nil {
+		writeDBError(w, err)
+		return
+	}
+	if p, ok := principalFrom(r); ok && !p.canCollection(q.Collection) {
+		writeError(w, http.StatusForbidden, "forbidden collection: "+q.Collection)
+		return
+	}
+	docs, err := engine.ExecuteSQL(s.db, q)
 	if err != nil {
 		writeDBError(w, err)
 		return

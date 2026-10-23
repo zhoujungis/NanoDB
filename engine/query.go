@@ -188,6 +188,8 @@ func matchFilterKey(doc map[string]any, key string, cond any) bool {
 			return false
 		}
 		return true
+	case "$text":
+		return matchText(doc, cond)
 	default:
 		actual, exists := getPath(doc, key)
 		return matchField(actual, exists, cond)
@@ -236,6 +238,8 @@ func hasOperator(m map[string]any) bool {
 
 func applyOperator(op string, actual any, exists bool, val any) bool {
 	switch op {
+	case "$geoWithin":
+		return matchGeoWithin(actual, exists, val)
 	case "$eq":
 		if !exists {
 			return val == nil

@@ -73,7 +73,9 @@ func allowRequest(p principal, method, path string) bool {
 		return true
 	}
 	read := method == http.MethodGet || method == http.MethodHead || method == http.MethodOptions
-	if !read && !p.canWrite() {
+	// SQL 接口只读，read 角色也允许调用；集合白名单在解析语句后校验。
+	sqlRequest := len(parts) == 2 && parts[1] == "sql"
+	if !read && !p.canWrite() && !sqlRequest {
 		return false
 	}
 	if parts[1] == "admin" {
@@ -98,6 +100,11 @@ func collectionOfPath(parts []string) string {
 	}
 	switch parts[1] {
 	case "aggregate", "indexes":
+		if len(parts) >= 3 {
+			return parts[2]
+		}
+		return ""
+	case "sql":
 		if len(parts) >= 3 {
 			return parts[2]
 		}
