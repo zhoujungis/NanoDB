@@ -19,7 +19,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
 
       - name: gofmt 检查
         shell: pwsh
@@ -49,7 +48,6 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-          cache: true
 
       # WiX 5 基于 .NET 6 运行，显式安装对应运行时避免依赖 runner 镜像。
       - uses: actions/setup-dotnet@v4
