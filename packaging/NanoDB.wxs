@@ -15,7 +15,7 @@
       Scope="perMachine"
       Language="1033">
 
-    <!-- latest 每次提交都会重建同版本安装包，允许同版本覆盖升级。 -->
+    <!-- 版本号随每次发布递增；允许同版本覆盖安装，便于重跑流水线。 -->
     <MajorUpgrade AllowSameVersionUpgrades="yes"
                   DowngradeErrorMessage="A newer version of NanoDB is already installed." />
     <MediaTemplate EmbedCab="yes" />
