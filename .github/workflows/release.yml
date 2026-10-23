@@ -167,10 +167,12 @@ jobs:
           VERSION: ${{ needs.package.outputs.version }}
         run: |
           $tag = "v$env:VERSION"
-          $exe = "dist/nanodb-$env:VERSION-windows-amd64.exe"
-          $msi = "dist/nanodb-$env:VERSION-windows-amd64.msi"
-          if (-not (Test-Path $exe)) { Rename-Item dist/nanodb.exe $exe }
-          if (-not (Test-Path $msi)) { Rename-Item dist/nanodb-windows-amd64.msi $msi }
+          $exeName = "nanodb-$env:VERSION-windows-amd64.exe"
+          $msiName = "nanodb-$env:VERSION-windows-amd64.msi"
+          Rename-Item -Path dist/nanodb.exe -NewName $exeName
+          Rename-Item -Path dist/nanodb-windows-amd64.msi -NewName $msiName
+          $exe = "dist/$exeName"
+          $msi = "dist/$msiName"
 
           gh release view $tag 2>$null | Out-Null
           if ($LASTEXITCODE -ne 0) {
