@@ -1,0 +1,143 @@
+name: Release
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: 全量测试
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt 检查
+        shell: pwsh
+        run: |
+          $unformatted = gofmt -l .
+          if ($unformatted) {
+            Write-Host "以下文件未按 gofmt 格式化："
+            $unformatted | ForEach-Object { Write-Host "  $_" }
+            exit 1
+          }
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test
+        run: go test ./... -count=1
+
+  package:
+    name: 构建 exe / msi
+    needs: test
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # WiX 5 基于 .NET 6 运行，显式安装对应运行时避免依赖 runner 镜像。
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "6.0.x"
+
+      - name: 解析版本号
+        id: version
+        shell: pwsh
+        run: |
+          $ref = "${{ github.ref_name }}"
+          if ($ref -match '^v(\d+\.\d+\.\d+)$') {
+            $ver = $Matches[1]
+          } else {
+            $match = Select-String -Path engine/db.go -Pattern 'Version\s*=\s*"(\d+\.\d+\.\d+)"' | Select-Object -First 1
+            $ver = if ($match) { $match.Matches[0].Groups[1].Value } else { "0.1.0" }
+          }
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          Write-Host "构建版本: $ver"
+
+      - name: 构建 exe
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist, packaging | Out-Null
+          go build -trimpath -ldflags "-s -w" -o dist/nanodb.exe ./cmd/nanodb
+          Copy-Item dist/nanodb.exe packaging/nanodb.exe -Force
+          ./dist/nanodb.exe help | Out-Null
+
+      - name: 构建 msi
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          $env:PATH = "$env:USERPROFILE\.dotnet\tools;$env:PATH"
+          wix build -arch x64 `
+            -d Version=${{ steps.version.outputs.version }} `
+            -bindpath packaging `
+            -o dist/nanodb-windows-amd64.msi `
+            packaging/NanoDB.wxs
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: nanodb-windows-amd64
+          path: |
+            dist/nanodb.exe
+            dist/nanodb-windows-amd64.msi
+          if-no-files-found: error
+
+  publish:
+    name: 更新 tag 与发布
+    needs: package
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nanodb-windows-amd64
+          path: dist
+
+      - name: 发布版本 tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release view $env:TAG 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:TAG --verify-tag --title "NanoDB $env:TAG" --notes "NanoDB $env:TAG"
+          }
+          gh release upload $env:TAG dist/nanodb.exe dist/nanodb-windows-amd64.msi --clobber
+
+      - name: 更新 latest tag 与发布
+        if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git tag -f latest
+          git push -f origin latest
+
+          $notes = "Automated build from ${{ github.sha }}"
+          gh release view latest 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create latest --verify-tag --title "NanoDB latest" --notes $notes
+          }
+          gh release upload latest dist/nanodb.exe dist/nanodb-windows-amd64.msi --clobber
+          gh release edit latest --title "NanoDB latest" --notes $notes

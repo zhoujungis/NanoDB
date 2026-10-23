@@ -1,0 +1,4 @@
+dist/
+bin/
+packaging/nanodb.exe
+nanodb-data/

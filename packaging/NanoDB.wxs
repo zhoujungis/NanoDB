@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  NanoDB 的 Windows MSI 安装包定义（WiX Toolset v4/v5）。
+  构建时由 CI 把 nanodb.exe 复制到本文件同级目录，
+  再执行：
+    wix build -arch x64 -d Version=0.1.0 -bindpath packaging \
+      -o dist/nanodb-windows-amd64.msi packaging/NanoDB.wxs
+-->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="NanoDB"
+      Manufacturer="NanoDB"
+      Version="$(var.Version)"
+      UpgradeCode="{7E1F4C2A-9F6B-4C57-9C1D-2B5A8E3D4F60}"
+      Scope="perMachine"
+      Language="1033">
+
+    <!-- latest 每次提交都会重建同版本安装包，允许同版本覆盖升级。 -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+                  DowngradeErrorMessage="A newer version of NanoDB is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Feature Id="Main" Title="NanoDB" Level="1">
+      <ComponentGroupRef Id="NanoDBFiles" />
+    </Feature>
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="NanoDB" />
+    </StandardDirectory>
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="NanoDBFiles" Directory="INSTALLFOLDER">
+      <Component Id="NanoDBExe">
+        <File Id="NanoDBExeFile" Source="nanodb.exe" />
+        <!-- 安装后可直接在任意终端执行 nanodb，卸载时移除该 PATH 项。 -->
+        <Environment Id="PathEntry" Name="PATH" Value="[INSTALLFOLDER]"
+                     Action="set" Part="last" System="yes" Permanent="no" />
+      </Component>
+    </ComponentGroup>
+  </Fragment>
+</Wix>
